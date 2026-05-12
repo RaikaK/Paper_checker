@@ -7,7 +7,7 @@ from google import genai
 import requests
 
 # --- 設定 ---
-API_KEY = os.getenv("GEMINI_API_KEY")
+API_KEY = os.getenv("GEMINI_API_KEY_2")
 DISCORD_URL = os.getenv("DISCORD_WEBHOOK_URL")
 HISTORY_FILE = "history.txt"
 RETENTION_DAYS = 10.5
