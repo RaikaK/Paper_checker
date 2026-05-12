@@ -41,13 +41,13 @@ def manage_history():
 
 def get_hf_papers():
     try:
-        url = "[https://huggingface.co/api/daily_papers](https://huggingface.co/api/daily_papers)"
+        url = "https://huggingface.co/api/daily_papers"
         res = requests.get(url, timeout=15)
-        return [{"id": i['paper']['id'], "title": i['paper']['title'], "summary": i['paper'].get('summary', ''), "url": f"[https://arxiv.org/pdf/](https://arxiv.org/pdf/){i['paper']['id']}.pdf", "source": "Hugging Face"} for i in res.json()]
+        res.raise_for_status()
+        return [{"id": i['paper']['id'], "title": i['paper']['title'], "summary": i['paper'].get('summary', ''), "url": f"https://arxiv.org/pdf/{i['paper']['id']}.pdf", "source": "Hugging Face"} for i in res.json()]
     except: return []
 
 def get_arxiv_papers():
-    # 有力企業や主要学会のキーワードを強化
     keywords = '(CVPR OR NeurIPS OR ICLR OR ICML OR ACL OR Google OR Meta OR OpenAI OR NVIDIA OR DeepMind OR Microsoft)'
     query = f'({keywords}) AND (cat:cs.AI OR cat:cs.LG OR cat:cs.CL)'
     search = arxiv.Search(query=query, max_results=20, sort_by=arxiv.SortCriterion.SubmittedDate)
@@ -57,97 +57,85 @@ def get_arxiv_papers():
     except: return []
 
 def call_llm(prompt):
-    free_models = [
-        "google/gemini-2.0-flash-001",
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "google/gemma-4-31b-it:free",
-        "qwen/qwen3-coder:free",
-        "openai/gpt-oss-120b:free"
-    ]
+    models = ["google/gemini-2.0-flash-001", "meta-llama/llama-3.3-70b-instruct:free", "google/gemma-4-31b-it:free", "qwen/qwen3-coder:free"]
     if client:
         try:
             res = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
             return res.text
         except: pass
     if OPENROUTER_KEY:
-        for model_id in free_models[1:]:
+        for m_id in models[1:]:
             try:
-                response = requests.post(
-                    url="[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)",
+                resp = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
                     headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-                    json={"model": model_id, "messages": [{"role": "user", "content": prompt}]},
+                    json={"model": m_id, "messages": [{"role": "user", "content": prompt}]},
                     timeout=60
                 )
-                if response.status_code == 200:
-                    return response.json()['choices'][0]['message']['content']
+                if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
             except: continue
     return None
 
 def parse_json_from_text(text):
-    """AIの回答から強引にJSON配列を抽出する"""
     if not text: return None
     try:
-        # マークダウンの ```json ... ``` を除去
-        text = re.sub(r'```json\s*', '', text)
-        text = re.sub(r'
-```', '', text)
-        # 最初の [ から 最後の ] までを抜き出す
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        if match:
-            return json.loads(match.group())
+        # 文字列のクリーンアップ（SyntaxErrorの原因になりやすい改行等を除去）
+        cleaned = text.strip()
+        # JSON配列の開始 [ と終了 ] を探す
+        start = cleaned.find('[')
+        end = cleaned.rfind(']') + 1
+        if start != -1 and end != 0:
+            json_str = cleaned[start:end]
+            return json.loads(json_str)
     except Exception as e:
         print(f"JSON Parse Error: {e}")
-        print(f"Original Text: {text}") # デバッグ用に表示
     return None
 
 def main():
     history = manage_history()
-    hf_papers = get_hf_papers()
-    arxiv_papers = get_arxiv_papers()
-    all_papers = hf_papers + arxiv_papers
-    new_papers = [p for p in all_papers if p['id'] not in history]
+    hf = get_hf_papers()
+    ar = get_arxiv_papers()
+    new_papers = [p for p in (hf + ar) if p['id'] not in history]
     
     if not new_papers:
-        print("No new papers today."); return
+        print("No new papers."); return
 
-    context = json.dumps(new_papers, ensure_ascii=False)
     prompt = f"""
-    最先端AIリサーチの目利きとして、以下のリストから【4本】厳選し、必ず指定のJSON配列形式で出力してください。
-    
-    【ルール】
-    1. sourceが'Hugging Face'のものを最低2本は含める。
-    2. arXivは大手企業や主要学会(Google, Meta, CVPR等)のものを優先。
-    3. 出力は挨拶や解説を一切含まず、純粋なJSON配列のみにすること。
+    最先端AIリサーチの専門家として、以下の論文リストから【4本】厳選し、指定のJSON形式で出力してください。
+    【条件】
+    1. sourceが'Hugging Face'のものを最低2本含める。
+    2. arXivは大手企業や主要学会のものを優先。
+    3. 解説不要、純粋なJSON配列のみ。
 
     [
       {{
         "title": "日本語訳タイトル",
         "url": "URL",
         "source": "提供元",
-        "summary": "3行要約(技術的なポイント)",
+        "summary": "3行要約(技術詳細)",
         "tags": ["タグ1", "タグ2"],
-        "layman_point": "一般人が興味を持ちそうなポイント",
+        "layman_point": "一般向け注目点",
         "interest_score": 10,
         "applicability_score": 5
       }}
     ]
-    データ: {context}
+    データ: {json.dumps(new_papers, ensure_ascii=False)}
     """
     
-    raw_report = call_llm(prompt)
-    selected_papers = parse_json_from_text(raw_report)
+    report_text = call_llm(prompt)
+    selected = parse_json_from_text(report_text)
     
-    if selected_papers:
-        today_str = datetime.now().strftime('%Y-%m-%d')
-        # 1. リストの送信
-        header_msg = f"📅 **{today_str} 厳選AIニュース**\n"
-        for i, p in enumerate(selected_papers, 1):
-            header_msg += f"{i}. {p['title']} ({p['source']})\n"
-        requests.post(DISCORD_URL, json={"content": header_msg})
+    if selected:
+        today = datetime.now().strftime('%Y-%m-%d')
+        # 1. リスト送信
+        header = f"📅 **{today} 厳選AIニュース**\n"
+        for i, p in enumerate(selected, 1):
+            header += f"{i}. {p['title']} ({p['source']})\n"
+        requests.post(DISCORD_URL, json={"content": header})
         time.sleep(1)
 
-        # 2. 個別の詳細送信
-        for p in selected_papers:
+        # 2. 詳細送信
+        for p in selected:
             msg = (
                 f"📄 **{p['title']}**\n"
                 f"🔗 URL: {p['url']}\n"
@@ -162,14 +150,13 @@ def main():
             time.sleep(1)
         
         # 履歴保存
-        now_str = datetime.now(timezone.utc).isoformat()
-        for p in new_papers: history[p['id']] = now_str
+        now_s = datetime.now(timezone.utc).isoformat()
+        for p in new_papers: history[p['id']] = now_s
         with open(HISTORY_FILE, "w") as f:
             for pid, ts in history.items(): f.write(f"{pid}|{ts}\n")
     else:
-        print("Failed to process LLM output.")
-        if raw_report:
-            print(f"Raw report starts with: {raw_report[:200]}")
+        print("Failed to parse LLM output.")
+        if report_text: print(f"Raw response: {report_text[:300]}")
 
 if __name__ == "__main__":
     main()
