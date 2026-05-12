@@ -23,7 +23,6 @@ def manage_history():
     now = datetime.now(timezone.utc)
     valid_history = {}
     if not os.path.exists(HISTORY_FILE):
-        open(HISTORY_FILE, 'w').close()
         return valid_history
     
     with open(HISTORY_FILE, "r") as f:
@@ -39,81 +38,91 @@ def manage_history():
                     except: continue
     return valid_history
 
-def get_arxiv_papers():
-    query = 'cat:cs.AI OR cat:cs.LG OR abs:"transformer" OR abs:"agent" OR abs:"robot"'
-    search = arxiv.Search(query=query, max_results=30, sort_by=arxiv.SortCriterion.SubmittedDate)
-    for i in range(3):
-        try:
-            return list(arxiv_client.results(search))
-        except Exception as e:
-            print(f"arXiv retry {i+1}/3: {e}")
-            time.sleep(15 * (i + 1))
-    raise Exception("arXiv is down")
-
-def get_hf_papers_fallback():
-    url = "https://huggingface.co/api/daily_papers"
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        return [{"id": i['paper']['id'], "title": i['paper']['title'], "summary": i['paper'].get('summary', ''), "url": f"https://arxiv.org/pdf/{i['paper']['id']}.pdf"} for i in data]
-    except:
-        return []
-
-def call_gemini_with_retry(prompt):
-    """Gemini APIをモデルを切り替えながらリトライ呼び出しする"""
-    models_to_try = ['gemini-2.0-flash', 'gemini-1.5-flash']
+def get_papers():
+    """arXiv (前日のAI関連) -> ダメなら Hugging Face (AIトレンド)"""
+    # 前日の日付（UTC）を取得
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
     
-    for model_name in models_to_try:
-        for i in range(3): # 各モデルで3回試行
-            try:
-                print(f"Calling {model_name} (Attempt {i+1}/3)...")
-                response = client.models.generate_content(model=model_name, contents=prompt)
-                return response.text
-            except Exception as e:
-                print(f"Gemini API error with {model_name}: {e}")
-                if "429" in str(e):
-                    wait_time = 60 # 429エラーなら1分待つ
-                    print(f"Quota exceeded. Waiting {wait_time}s...")
-                    time.sleep(wait_time)
-                else:
-                    time.sleep(5)
-    raise Exception("All Gemini models failed or quota exhausted.")
+    # 主要なAIカテゴリーに限定
+    # cs.AI (Artificial Intelligence), cs.LG (Machine Learning), cs.CV (Computer Vision), cs.CL (NLP)
+    query = 'cat:cs.AI OR cat:cs.LG OR cat:cs.CV OR cat:cs.CL'
+    search = arxiv.Search(query=query, max_results=50, sort_by=arxiv.SortCriterion.SubmittedDate)
+    
+    try:
+        print(f"Fetching papers published on {yesterday} from arXiv...")
+        results = list(arxiv_client.results(search))
+        
+        # 前日に公開されたものだけを抽出
+        filtered_papers = []
+        for r in results:
+            if r.published.date() == yesterday:
+                filtered_papers.append({
+                    "id": r.entry_id.split('/')[-1],
+                    "title": r.title,
+                    "summary": r.summary,
+                    "url": r.pdf_url
+                })
+        
+        # 該当が少ない場合は少し範囲を広げる（空だと困るため）
+        if len(filtered_papers) < 4:
+            print("Few papers found for yesterday, taking latest AI papers.")
+            filtered_papers = [{"id": r.entry_id.split('/')[-1], "title": r.title, "summary": r.summary, "url": r.pdf_url} for r in results[:10]]
+            
+        return filtered_papers, "arXiv"
+        
+    except Exception as e:
+        print(f"arXiv Access Error: {e}. Switching to HF (AI Trends)...")
+        # Hugging Face Daily Papersはほぼ100% AI/ML関連です
+        url = "https://huggingface.co/api/daily_papers"
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        return [{"id": i['paper']['id'], "title": i['paper']['title'], "summary": i['paper'].get('summary', ''), "url": f"https://arxiv.org/pdf/{i['paper']['id']}.pdf"} for i in data], "Hugging Face"
+
+def call_gemini(prompt):
+    for model_name in ['gemini-2.0-flash', 'gemini-1.5-flash']:
+        try:
+            print(f"Requesting to {model_name}...")
+            response = client.models.generate_content(model=model_name, contents=prompt)
+            return response.text
+        except Exception as e:
+            print(f"Gemini error ({model_name}): {e}")
+            time.sleep(30)
+    return None
 
 def main():
     history = manage_history()
-    source_name = "arXiv"
-    
-    try:
-        results = get_arxiv_papers()
-        papers_to_check = [{"id": r.entry_id.split('/')[-1], "title": r.title, "summary": r.summary, "url": r.pdf_url} for r in results]
-    except:
-        source_name = "Hugging Face (Fallback)"
-        papers_to_check = get_hf_papers_fallback()
+    papers_to_check, source_name = get_papers()
 
+    # 未読の論文のみ抽出
     new_papers = [p for p in papers_to_check if p['id'] not in history]
     
     if not new_papers:
-        print("新規論文なし")
+        print("新規のAI論文はありませんでした。")
         return
 
     context = "\n\n".join([f"ID: {p['id']}\nTitle: {p['title']}\nAbstract: {p['summary']}" for p in new_papers])
-    prompt = f"あなたは世界最高のAI論文ウォッチャーです。以下のリスト（提供元: {source_name}）から特に面白い4本を選び、日本語で要約して：\n\n{context}"
+    prompt = f"あなたはAI専門のリサーチャーです。以下の{source_name}の最新AI論文から特に注目すべき4本を選び、日本語で要約して：\n\n{context}"
     
-    try:
-        report = call_gemini_with_retry(prompt)
-        prefix = "🚀 **本日の厳選論文**" if source_name == "arXiv" else "⚠️ **arXiv混雑中のためHFから抽出**"
-        requests.post(DISCORD_URL, json={"content": f"{prefix}\n\n{report}"})
-
-        # 履歴更新
-        now_str = datetime.now(timezone.utc).isoformat()
-        for p in new_papers:
-            history[p['id']] = now_str
-        with open(HISTORY_FILE, "w") as f:
-            for pid, ts in history.items():
-                f.write(f"{pid}|{ts}\n")
-    except Exception as e:
-        print(f"Final failure: {e}")
+    report = call_gemini(prompt)
+    
+    if report:
+        try:
+            prefix = "📰 **昨日の厳選AI論文**" if source_name == "arXiv" else "⚠️ **HFより抽出された最新AIトレンド**"
+            res = requests.post(DISCORD_URL, json={"content": f"{prefix}\n\n{report}"}, timeout=10)
+            res.raise_for_status()
+            
+            # 成功時のみ履歴保存
+            now_str = datetime.now(timezone.utc).isoformat()
+            for p in new_papers:
+                history[p['id']] = now_str
+            with open(HISTORY_FILE, "w") as f:
+                for pid, ts in history.items():
+                    f.write(f"{pid}|{ts}\n")
+            print("Successfully posted and updated history.")
+        except Exception as e:
+            print(f"Discord Post Error: {e}")
+    else:
+        print("Failed to generate report.")
 
 if __name__ == "__main__":
     main()
