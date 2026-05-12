@@ -9,15 +9,15 @@ import requests
 API_KEY = os.getenv("GEMINI_API_KEY")
 DISCORD_URL = os.getenv("DISCORD_WEBHOOK_URL")
 HISTORY_FILE = "history.txt"
-RETENTION_DAYS = 10.5
+RETENTION_DAYS = 10.5 # 1週間半
 
+# 起動チェック
 if not API_KEY or not DISCORD_URL:
-    print("Error: APIキーまたはDiscord URLが設定されていません。")
+    print("Error: Secretsが設定されていません。")
     sys.exit(1)
 
-# 最新のSDKクライアント (2026年仕様)
+# 2026年最新SDKクライアント
 client = genai.Client(api_key=API_KEY)
-# arXivクライアントの作成
 arxiv_client = arxiv.Client()
 
 def manage_history():
@@ -37,62 +37,37 @@ def manage_history():
                         ts = datetime.fromisoformat(ts_str)
                         if now - ts < timedelta(days=RETENTION_DAYS):
                             valid_history[pid] = ts_str
-                    except ValueError:
-                        continue
+                    except: continue
     return valid_history
 
 def main():
     history = manage_history()
     
-    # 検索条件
-    query = 'cat:cs.AI OR cat:cs.LG OR abs:"transformer" OR abs:"llm" OR abs:"agent"'
-    search = arxiv.Search(
-        query=query,
-        max_results=40,
-        sort_by=arxiv.SortCriterion.SubmittedDate
-    )
+    # 検索（M1の研究にも役立つAI・機械学習系）
+    query = 'cat:cs.AI OR cat:cs.LG OR abs:"transformer" OR abs:"agent"'
+    search = arxiv.Search(query=query, max_results=40, sort_by=arxiv.SortCriterion.SubmittedDate)
     
     new_papers = []
-    # arxiv_client.results(search) を使うのが最新の書き方です
     for result in arxiv_client.results(search):
         pid = result.entry_id.split('/')[-1]
         if pid not in history:
-            new_papers.append({
-                "id": pid,
-                "title": result.title,
-                "summary": result.summary,
-                "url": result.pdf_url
-            })
+            new_papers.append({"id": pid, "title": result.title, "summary": result.summary, "url": result.pdf_url})
     
     if not new_papers:
-        print("新規論文はありませんでした。")
+        print("新規論文なし")
         return
 
-    # AIへのプロンプト
+    # プロンプト（最新論文を目利きさせる）
     context = "\n\n".join([f"ID: {p['id']}\nTitle: {p['title']}\nAbstract: {p['summary']}" for p in new_papers])
-    prompt = f"""
-    あなたは技術トレンドに敏感なAIエンジニアです。
-    以下の論文リストから、特に興味深く、SNS等で話題になりそうな4本を選び、日本語で解説してください。
+    prompt = f"あなたは技術トレンドに敏感なAIエンジニアです。以下の論文から特に面白い4本を選び日本語で要約して：\n\n{context}"
     
-    【タイトル】（日本語訳）
-    【注目理由】（1行）
-    【概要】（専門用語を交えつつ3行で）
-    【URL】
-    ------------------
-    {context}
-    """
+    # 2026年標準モデルを使用
+    response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
     
-    # 最新モデル gemini-2.0-flash を使用
-    response = client.models.generate_content(
-        model='gemini-2.0-flash',
-        contents=prompt
-    )
-    report = response.text
-
     # Discord通知
-    requests.post(DISCORD_URL, json={"content": f"🚀 **本日の厳選論文 (4本)**\n\n{report}"})
+    requests.post(DISCORD_URL, json={"content": f"🚀 **本日の厳選論文**\n\n{response.text}"})
 
-    # 履歴保存
+    # 履歴更新（1.5週間分）
     now_str = datetime.now(timezone.utc).isoformat()
     for p in new_papers:
         history[p['id']] = now_str
