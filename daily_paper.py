@@ -1,6 +1,8 @@
 import os
 import sys
 import time
+import json
+import re
 from datetime import datetime, timedelta, timezone
 import arxiv
 from google import genai
@@ -23,89 +25,76 @@ arxiv_client = arxiv.Client()
 def manage_history():
     now = datetime.now(timezone.utc)
     valid_history = {}
-    if not os.path.exists(HISTORY_FILE): return valid_history
-    with open(HISTORY_FILE, "r") as f:
-        for line in f:
-            if "|" in line:
-                parts = line.strip().split("|")
-                if len(parts) == 2:
-                    pid, ts_str = parts
-                    try:
-                        ts = datetime.fromisoformat(ts_str)
-                        if now - ts < timedelta(days=RETENTION_DAYS):
-                            valid_history[pid] = ts_str
-                    except: continue
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r") as f:
+            for line in f:
+                if "|" in line:
+                    parts = line.strip().split("|")
+                    if len(parts) == 2:
+                        pid, ts_str = parts
+                        try:
+                            ts = datetime.fromisoformat(ts_str)
+                            if now - ts < timedelta(days=RETENTION_DAYS):
+                                valid_history[pid] = ts_str
+                        except: continue
     return valid_history
 
 def get_papers():
-    """arXiv (前日のAI関連) -> ダメなら HF"""
     yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
-    # カテゴリをAI/機械学習に厳選
     query = 'cat:cs.AI OR cat:cs.LG OR cat:cs.CV OR cat:cs.CL'
     search = arxiv.Search(query=query, max_results=30, sort_by=arxiv.SortCriterion.SubmittedDate)
     try:
         results = list(arxiv_client.results(search))
         filtered = [p for p in results if p.published.date() == yesterday]
-        if not filtered: filtered = results[:6]
-        return [{"id": r.entry_id.split('/')[-1], "title": r.title, "summary": r.summary, "url": r.pdf_url} for r in filtered], "arXiv"
+        if not filtered: filtered = results[:8]
+        return [{"id": r.entry_id.split('/')[-1], "title": r.title, "summary": r.summary, "url": r.pdf_url, "date": r.published.strftime('%Y-%m-%d')} for r in filtered], "arXiv"
     except:
         res = requests.get("https://huggingface.co/api/daily_papers", timeout=15)
-        return [{"id": i['paper']['id'], "title": i['paper']['title'], "summary": i['paper'].get('summary', ''), "url": f"https://arxiv.org/pdf/{i['paper']['id']}.pdf"} for i in res.json()], "Hugging Face"
-
-def call_openrouter(prompt):
-    """ユーザー提供の最新モデルIDリストによるバックアップ"""
-    if not OPENROUTER_KEY: return None
-    print("Starting OpenRouter sequence with verified IDs...")
-    
-    # 提示されたリンクと名称に基づく正確なモデルIDリスト (2026年版)
-    free_models = [
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "google/gemma-4-31b:free",
-        "qwen/qwen3-coder-480b-a35b:free",
-        "openai/gpt-oss-120b:free",
-        "mistralai/pixtral-12b:free" # 予備
-    ]
-    
-    for model_id in free_models:
-        try:
-            print(f"Trying: {model_id}")
-            response = requests.post(
-                url="https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_KEY}",
-                    "HTTP-Referer": "https://github.com/RaikaK/Paper_checker",
-                },
-                json={
-                    "model": model_id,
-                    "messages": [{"role": "user", "content": prompt}]
-                },
-                timeout=45
-            )
-            res_json = response.json()
-            if response.status_code == 200 and 'choices' in res_json:
-                print(f"Success! Model used: {model_id}")
-                return res_json['choices'][0]['message']['content']
-            else:
-                msg = res_json.get('error', {}).get('message', 'Unknown Error')
-                print(f"Failed {model_id}: {msg}")
-        except Exception as e:
-            print(f"Request error: {e}")
-    return None
+        return [{"id": i['paper']['id'], "title": i['paper']['title'], "summary": i['paper'].get('summary', ''), "url": f"https://arxiv.org/pdf/{i['paper']['id']}.pdf", "date": "Unknown"} for i in res.json()], "Hugging Face"
 
 def call_llm(prompt):
-    # 1. Google Gemini (本家)
-    if client:
-        # モデル名の指定をより標準的な形式に変更
-        for m in ['gemini-2.0-flash', 'gemini-1.5-flash']:
-            try:
-                print(f"Attempting Google {m}...")
-                res = client.models.generate_content(model=m, contents=prompt)
-                return res.text
-            except Exception as e:
-                print(f"Google {m} rejected: {e}")
+    # モデルIDのリスト
+    free_models = [
+        "google/gemini-2.0-flash-001", # Google本家
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "google/gemma-4-31b-it:free",
+        "qwen/qwen3-coder:free",
+        "openai/gpt-oss-120b:free"
+    ]
     
-    # 2. OpenRouter (提供された最新無料モデル群)
-    return call_openrouter(prompt)
+    # 1. Google Gemini 本家 (clientが有効な場合)
+    if client:
+        try:
+            print("Trying Google Gemini...")
+            res = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+            return res.text
+        except: pass
+
+    # 2. OpenRouter バックアップ
+    if OPENROUTER_KEY:
+        for model_id in free_models[1:]:
+            try:
+                print(f"Trying OpenRouter: {model_id}")
+                response = requests.post(
+                    url="https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+                    json={"model": model_id, "messages": [{"role": "user", "content": prompt}]},
+                    timeout=60
+                )
+                res_json = response.json()
+                if response.status_code == 200:
+                    return res_json['choices'][0]['message']['content']
+            except: continue
+    return None
+
+def parse_json_from_text(text):
+    """LLMの回答からJSON部分を抽出してパースする"""
+    try:
+        # Markdownのブロックコード等を除去
+        json_str = re.search(r'\[.*\]', text, re.DOTALL).group()
+        return json.loads(json_str)
+    except:
+        return None
 
 def main():
     history = manage_history()
@@ -113,29 +102,70 @@ def main():
     new_papers = [p for p in papers_to_check if p['id'] not in history]
     
     if not new_papers:
-        print("No new papers found since yesterday.")
+        print("No new papers.")
         return
 
-    context = "\n\n".join([f"ID: {p['id']}\nTitle: {p['title']}\nAbstract: {p['summary']}" for p in new_papers])
-    prompt = f"AIリサーチャーとして、以下の{source_name}の最新AI論文から注目の4本を選び、日本語で要約して。重要な数式があればその意味も添えて：\n\n{context}"
+    context = json.dumps(new_papers, ensure_ascii=False)
+    prompt = f"""
+    以下の論文データ(JSON)を分析し、特に興味深い4本を厳選して以下のJSON配列形式で出力してください。
+    余計な解説は不要です。配列のみを返してください。
+
+    [
+      {{
+        "title": "論文タイトル(日本語訳)",
+        "url": "アクセスURL",
+        "pub_date": "投稿日時",
+        "summary": "技術的な要約(3行程度)",
+        "tags": ["タグ1", "タグ2"],
+        "layman_point": "一般人が興味を持ちそうなポイント",
+        "interest_score": 10,
+        "applicability_score": 5
+      }}
+    ]
+
+    ※interest_score: 一般人の興味を引くか(10段階)
+    ※applicability_score: 幅広い人が応用可能か(10) vs 専門的か(1)
     
-    report = call_llm(prompt)
+    データ: {context}
+    """
     
-    if report:
-        try:
-            prefix = "📰 **昨日の厳選AI論文**" if source_name == "arXiv" else "⚠️ **HF抽出AIトレンド**"
-            requests.post(DISCORD_URL, json={"content": f"{prefix}\n\n{report}"}, timeout=15).raise_for_status()
-            
-            # 成功時のみ履歴保存
-            now_str = datetime.now(timezone.utc).isoformat()
-            for p in new_papers: history[p['id']] = now_str
-            with open(HISTORY_FILE, "w") as f:
-                for pid, ts in history.items(): f.write(f"{pid}|{ts}\n")
-            print("Successfully completed.")
-        except Exception as e:
-            print(f"Discord notify error: {e}")
+    raw_report = call_llm(prompt)
+    selected_papers = parse_json_from_text(raw_report)
+    
+    if selected_papers:
+        # 1. 最初のメッセージ：日付とリスト
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        header_msg = f"📅 **{today_str} 厳選AI論文リスト ({source_name})**\n\n"
+        for i, p in enumerate(selected_papers, 1):
+            tags_str = ", ".join(p['tags'])
+            header_msg += f"{i}. {p['title']} [{tags_str}]\n"
+        
+        requests.post(DISCORD_URL, json={"content": header_msg})
+        time.sleep(1)
+
+        # 2. 各論文ごとの詳細メッセージ
+        for p in selected_papers:
+            detail_msg = (
+                f"📄 **{p['title']}**\n"
+                f"🔗 URL: {p['url']}\n"
+                f"📅 投稿日: {p['pub_date']}\n"
+                f"📝 要約: {p['summary']}\n"
+                f"🏷️ タグ: {', '.join(p['tags'])}\n"
+                f"💡 一般向けポイント: {p['layman_point']}\n"
+                f"⭐ 興味深さ: {p['interest_score']}/10\n"
+                f"🛠️ 汎用性: {p['applicability_score']}/10 (10:幅広い, 1:専門的)\n"
+                f"--------------------------------------------"
+            )
+            requests.post(DISCORD_URL, json={"content": detail_msg})
+            time.sleep(1)
+        
+        # 履歴保存
+        now_str = datetime.now(timezone.utc).isoformat()
+        for p in new_papers: history[p['id']] = now_str
+        with open(HISTORY_FILE, "w") as f:
+            for pid, ts in history.items(): f.write(f"{pid}|{ts}\n")
     else:
-        print("Fatal: All LLM routes failed. Check OpenRouter Key or Model IDs.")
+        print("Failed to parse LLM response.")
 
 if __name__ == "__main__":
     main()
