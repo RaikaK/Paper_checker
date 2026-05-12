@@ -1,21 +1,23 @@
 name: Daily Paper Notifier
 on:
   schedule:
-    - cron: '0 22 * * *' # 毎日朝7時(JST)
+    - cron: '0 22 * * *'
   workflow_dispatch:
 permissions:
   contents: write
 jobs:
   run-script:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12' # バージョンアップ
       - name: Install dependencies
-        run: pip install arxiv google-generativeai requests
+        run: pip install arxiv google-genai requests
       - name: Run script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
