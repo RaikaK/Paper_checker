@@ -22,6 +22,13 @@ if not DISCORD_URL:
 client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 arxiv_client = arxiv.Client()
 
+def extract_github_url(text):
+    """テキスト内からGitHubのURLを探して返す"""
+    if not text:
+        return ""
+    match = re.search(r"https?://github\.com/[^\s,\]\)]+", text)
+    return match.group(0) if match else ""
+
 def manage_history():
     now = datetime.now(timezone.utc)
     valid_history = {}
@@ -44,7 +51,21 @@ def get_hf_papers():
         print("Fetching from Hugging Face...")
         res = requests.get("https://huggingface.co/api/daily_papers", timeout=15)
         res.raise_for_status()
-        return [{"id": i['paper']['id'], "title": i['paper']['title'], "summary": i['paper'].get('summary', ''), "url": f"https://arxiv.org/pdf/{i['paper']['id']}.pdf", "source": "Hugging Face"} for i in res.json()]
+        papers = []
+        for i in res.json():
+            p = i['paper']
+            # HF APIから取得できる日付を使用。なければ今日の日付
+            pub_date = p.get('publishedAt', datetime.now().isoformat())[:10]
+            papers.append({
+                "id": p['id'],
+                "title": p['title'],
+                "summary": p.get('summary', ''),
+                "url": f"https://arxiv.org/pdf/{p['id']}.pdf",
+                "source": "Hugging Face",
+                "published_date": pub_date,
+                "github_url": "" # 後ほどLLMまたは追加リサーチで補完可能
+            })
+        return papers
     except Exception as e:
         print(f"HF Fetch Error: {e}")
         return []
@@ -56,13 +77,25 @@ def get_arxiv_papers():
     search = arxiv.Search(query=query, max_results=20, sort_by=arxiv.SortCriterion.SubmittedDate)
     try:
         results = list(arxiv_client.results(search))
-        return [{"id": r.entry_id.split('/')[-1], "title": r.title, "summary": r.summary, "url": r.pdf_url, "source": "arXiv (Top Tier)"} for r in results]
+        papers = []
+        for r in results:
+            # コメント欄や要約からGitHubのURLを抽出
+            git_url = extract_github_url(r.comment) or extract_github_url(r.summary)
+            papers.append({
+                "id": r.entry_id.split('/')[-1],
+                "title": r.title,
+                "summary": r.summary,
+                "url": r.pdf_url,
+                "source": "arXiv (Top Tier)",
+                "published_date": r.published.strftime('%Y-%m-%d'),
+                "github_url": git_url
+            })
+        return papers
     except Exception as e:
         print(f"arXiv Fetch Error: {e}")
         return []
 
 def call_llm(prompt):
-    # 2026年最新の無料モデルリスト
     models = [
         "meta-llama/llama-3.3-70b-instruct:free",
         "google/gemma-4-31b-it:free",
@@ -71,7 +104,6 @@ def call_llm(prompt):
         "deepseek/deepseek-r1:free"
     ]
     
-    # 1. Google Gemini (本家)
     if client:
         for m_name in ['gemini-2.0-flash', 'gemini-1.5-flash']:
             try:
@@ -81,7 +113,6 @@ def call_llm(prompt):
             except Exception as e:
                 print(f"Gemini {m_name} failed: {e}")
 
-    # 2. OpenRouter (バックアップ)
     if OPENROUTER_KEY:
         for m_id in models:
             try:
@@ -107,7 +138,6 @@ def call_llm(prompt):
 def parse_json_from_text(text):
     if not text: return None
     try:
-        # JSONの開始と終了を探す
         start = text.find('[')
         end = text.rfind(']') + 1
         if start != -1 and end != 0:
@@ -115,7 +145,6 @@ def parse_json_from_text(text):
             return json.loads(json_str)
     except Exception as e:
         print(f"JSON Parse Error: {e}")
-        print(f"Raw text that failed to parse: \n{text}")
     return None
 
 def main():
@@ -123,7 +152,6 @@ def main():
     hf = get_hf_papers()
     ar = get_arxiv_papers()
     
-    # 未知の論文のみ
     all_papers = hf + ar
     new_papers = [p for p in all_papers if p['id'] not in history]
     
@@ -139,16 +167,18 @@ def main():
     1. sourceが'Hugging Face'のものを【必ず2本以上】選んでください。
     2. arXivは大手企業や有名学会のものを優先してください。
     3. JSON以外の説明、挨拶、コードブロック(```json等)は一切不要です。
-    4. 日本語で出力してください。
+    4. 出力はすべて【日本語】で行ってください。タイトルも適切な和訳にしてください。
 
     [
       {{
         "title": "タイトル(和訳)",
-        "url": "URL",
+        "url": "論文PDFのURL",
+        "github_url": "ソースコードのURL(あれば。データ内にあれば優先、なければ空文字)",
+        "published_date": "公開日(YYYY-MM-DD)",
         "source": "提供元",
-        "summary": "3行程度の技術要約",
+        "summary": "技術的な要約(日本語で3行程度)",
         "tags": ["タグ1", "タグ2"],
-        "layman_point": "一般人が興味を持ちそうな点",
+        "layman_point": "専門外の人でも凄さがわかるポイント(日本語)",
         "interest_score": 10,
         "applicability_score": 5
       }}
@@ -159,14 +189,13 @@ def main():
     
     report_text = call_llm(prompt)
     if not report_text:
-        print("CRITICAL: All LLM models failed to return any response.")
+        print("CRITICAL: All LLM models failed.")
         return
 
     selected = parse_json_from_text(report_text)
     
     if selected:
         today = datetime.now().strftime('%Y-%m-%d')
-        # リスト送信
         header = f"📅 **{today} 厳選AI論文リスト**\n"
         for i, p in enumerate(selected, 1):
             header += f"{i}. {p['title']} ({p['source']})\n"
@@ -174,11 +203,13 @@ def main():
         
         time.sleep(1)
 
-        # 詳細送信
         for p in selected:
+            git_info = f"💻 GitHub: {p['github_url']}\n" if p.get('github_url') else ""
             msg = (
                 f"📄 **{p['title']}**\n"
-                f"🔗 URL: {p['url']}\n"
+                f"📅 公開日: {p.get('published_date', '不明')}\n"
+                f"🔗 PDF: {p['url']}\n"
+                f"{git_info}"
                 f"🏢 Source: {p['source']}\n"
                 f"📝 要約: {p['summary']}\n"
                 f"🏷️ タグ: {', '.join(p['tags'])}\n"
@@ -189,7 +220,6 @@ def main():
             requests.post(DISCORD_URL, json={"content": msg})
             time.sleep(1)
         
-        # 履歴保存
         now_s = datetime.now(timezone.utc).isoformat()
         for p in new_papers: history[p['id']] = now_s
         with open(HISTORY_FILE, "w") as f:
