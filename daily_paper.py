@@ -54,16 +54,19 @@ def get_hf_papers():
         papers = []
         for i in res.json():
             p = i['paper']
-            # HF APIから取得できる日付を使用。なければ今日の日付
             pub_date = p.get('publishedAt', datetime.now().isoformat())[:10]
             papers.append({
                 "id": p['id'],
                 "title": p['title'],
                 "summary": p.get('summary', ''),
-                "url": f"https://arxiv.org/pdf/{p['id']}.pdf",
+                "pdf_url": f"https://arxiv.org/pdf/{p['id']}.pdf",
+                "arxiv_url": f"https://arxiv.org/abs/{p['id']}",
+                "hf_url": f"https://huggingface.co/papers/{p['id']}",
                 "source": "Hugging Face",
                 "published_date": pub_date,
-                "github_url": "" # 後ほどLLMまたは追加リサーチで補完可能
+                "github_url": "",
+                "journal_ref": "",
+                "comment": ""
             })
         return papers
     except Exception as e:
@@ -79,16 +82,20 @@ def get_arxiv_papers():
         results = list(arxiv_client.results(search))
         papers = []
         for r in results:
-            # コメント欄や要約からGitHubのURLを抽出
+            pid = r.entry_id.split('/')[-1]
             git_url = extract_github_url(r.comment) or extract_github_url(r.summary)
             papers.append({
-                "id": r.entry_id.split('/')[-1],
+                "id": pid,
                 "title": r.title,
                 "summary": r.summary,
-                "url": r.pdf_url,
+                "pdf_url": r.pdf_url,
+                "arxiv_url": f"https://arxiv.org/abs/{pid}",
+                "hf_url": "",
                 "source": "arXiv (Top Tier)",
                 "published_date": r.published.strftime('%Y-%m-%d'),
-                "github_url": git_url
+                "github_url": git_url,
+                "journal_ref": r.journal_ref or "",
+                "comment": r.comment or ""
             })
         return papers
     except Exception as e:
@@ -161,20 +168,29 @@ def main():
     print(f"Processing {len(new_papers)} new papers...")
 
     prompt = f"""
-    あなたはAIリサーチの専門家です。以下の論文リストから【4本】を厳選し、指定のJSON配列形式でのみ出力してください。
+    あなたはAIリサーチの専門家です。以下の論文リストから厳選し、指定のJSON配列形式でのみ出力してください。
+    原則として【4本】を選出しますが、データ内に「Survey論文（サーベイ、レビュー、包括的な解説論文）」が含まれている場合は、それらを最優先で追加し【最大5本】まで選出枠を広げてください。
     
     【厳守ルール】
-    1. sourceが'Hugging Face'のものを【必ず2本以上】選んでください。
-    2. arXivは大手企業や有名学会のものを優先してください。
-    3. JSON以外の説明、挨拶、コードブロック(```json等)は一切不要です。
-    4. 出力はすべて【日本語】で行ってください。タイトルも適切な和訳にしてください。
+    1. タイトルや要約に 'survey', 'review', 'overview', 'comprehensive study' などの文言が含まれる「Survey論文」があれば、通常の選定（4本）に加えて1枠追加し、合計最大5本として必ず出力に含めてください。Survey論文がない場合は、通常通り4本にしてください。
+    2. sourceが'Hugging Face'のものを【必ず2本以上】選んでください。
+    3. arXivは大手企業や有名学会のものを優先してください。
+    4. JSON以外の説明、挨拶、コードブロック(```json等)は一切不要です。
+    5. 出力テキストは指定がない限り【日本語】で行ってください。
+
+    【査読判定のヒント】
+    データ内の 'journal_ref' や 'comment' に学会名や「Accepted to ○○」といった記述がある場合は「査読あり（学会名）」、特に記載がなくプレプリント状態の場合は「Preprint（査読未定）」と判定してください。
 
     [
       {{
-        "title": "タイトル(和訳)",
-        "url": "論文PDFのURL",
-        "github_url": "ソースコードのURL(あれば。データ内にあれば優先、なければ空文字)",
+        "title_ja": "タイトル(日本語和訳)",
+        "title_en": "元の英語タイトル",
+        "pdf_url": "論文PDFのURL",
+        "arxiv_url": "arXivの概要ページのURL",
+        "hf_url": "Hugging Faceの論文ページのURL (データ内にあればそのまま、なければ空文字)",
+        "github_url": "ソースコードのURL(あれば優先、なければ空文字)",
         "published_date": "公開日(YYYY-MM-DD)",
+        "peer_review_status": "査読ステータス（例：『査読あり（CVPR 2026）』または『Preprint（査読未定）』）",
         "source": "提供元",
         "summary": "技術的な要約(日本語で3行程度)",
         "tags": ["タグ1", "タグ2"],
@@ -198,17 +214,22 @@ def main():
         today = datetime.now().strftime('%Y-%m-%d')
         header = f"📅 **{today} 厳選AI論文リスト**\n"
         for i, p in enumerate(selected, 1):
-            header += f"{i}. {p['title']} ({p['source']})\n"
+            header += f"{i}. {p['title_ja']} / {p['title_en']} ({p['source']})\n"
         requests.post(DISCORD_URL, json={"content": header})
         
         time.sleep(1)
 
         for p in selected:
             git_info = f"💻 GitHub: {p['github_url']}\n" if p.get('github_url') else ""
+            hf_info = f"🤗 Hugging Face: {p['hf_url']}\n" if p.get('hf_url') else ""
+            
             msg = (
-                f"📄 **{p['title']}**\n"
-                f"📅 公開日: {p.get('published_date', '不明')}\n"
-                f"🔗 PDF: {p['url']}\n"
+                f"📄 **{p['title_ja']}**\n"
+                f"🔤 原題: {p['title_en']}\n"
+                f"📅 公開日: {p.get('published_date', '不明')} | 🛡️ 査読: {p.get('peer_review_status', 'Preprint（査読未定）')}\n"
+                f"🔗 arXiv Abs: {p.get('arxiv_url', '不明')}\n"
+                f"📕 PDF: {p.get('pdf_url', '不明')}\n"
+                f"{hf_info}"
                 f"{git_info}"
                 f"🏢 Source: {p['source']}\n"
                 f"📝 要約: {p['summary']}\n"
