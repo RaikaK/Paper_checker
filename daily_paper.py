@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import re
+import traceback
 from datetime import datetime, timedelta, timezone
 import arxiv
 from google import genai
@@ -163,7 +164,11 @@ def main():
     new_papers = [p for p in all_papers if p['id'] not in history]
     
     if not new_papers:
-        print("No new papers found since last run."); return
+        today = datetime.now().strftime('%Y-%m-%d')
+        no_paper_msg = f"📅 **{today} 厳選AI論文リスト**\n本日新しく公表された（未読の）論文はありませんでした。"
+        requests.post(DISCORD_URL, json={"content": no_paper_msg})
+        print("No new papers found since last run. Notification sent to Discord.")
+        return
 
     print(f"Processing {len(new_papers)} new papers...")
 
@@ -205,7 +210,9 @@ def main():
     
     report_text = call_llm(prompt)
     if not report_text:
-        print("CRITICAL: All LLM models failed.")
+        err_msg = "⚠️ **致命的エラー**: すべてのLLMモデルからの応答取得に失敗したため、本日の選出処理を中断しました。"
+        print(err_msg)
+        requests.post(DISCORD_URL, json={"content": err_msg})
         return
 
     selected = parse_json_from_text(report_text)
@@ -247,7 +254,22 @@ def main():
             for pid, ts in history.items(): f.write(f"{pid}|{ts}\n")
         print("All processes finished successfully.")
     else:
-        print("Failed to parse the response as JSON.")
+        parse_err = "⚠️ **構文エラー**: LLMから応答はありましたが、JSON形式へのパースに失敗しました。出力を確認してください。"
+        print(parse_err)
+        requests.post(DISCORD_URL, json={"content": parse_err})
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # エラーの最終行（例外の型と原因メッセージ）だけを抽出
+        error_reason = "".join(traceback.format_exception_only(type(e), e)).strip()
+        error_msg = f"🚨 **プログラム実行エラーが発生しました**\n
+```\n{error_reason}\n```"
+        print(error_msg)
+        
+        if DISCORD_URL:
+            try:
+                requests.post(DISCORD_URL, json={"content": error_msg})
+            except Exception as discord_err:
+                print(f"Failed to send error notification to Discord: {discord_err}")
