@@ -49,7 +49,7 @@ def manage_history():
 
 def get_hf_papers():
     try:
-        print("Fetching from Hugging Face...")
+        print("Fetching from Hugging Face Daily...")
         res = requests.get("https://huggingface.co/api/daily_papers", timeout=15)
         res.raise_for_status()
         papers = []
@@ -72,6 +72,74 @@ def get_hf_papers():
         return papers
     except Exception as e:
         print(f"HF Fetch Error: {e}")
+        return []
+
+def get_hf_ranking_papers(history):
+    """新着がない場合のフォールバック：週間10位以内、月間15位以内から未読を補填"""
+    try:
+        print("Fetching ranking papers from Hugging Face...")
+        res = requests.get("https://huggingface.co/api/papers?sort=upvotes&limit=100", timeout=15)
+        res.raise_for_status()
+        
+        now = datetime.now(timezone.utc)
+        weekly_papers = []
+        monthly_papers = []
+        
+        for item in res.json():
+            pid = item.get('id')
+            if not pid: continue
+            
+            pub_str = item.get('publishedAt')
+            if not pub_str: continue
+            
+            try:
+                pub_date = datetime.fromisoformat(pub_str.replace('Z', '+00:00'))
+            except: continue
+            
+            days_ago = (now - pub_date).days
+            
+            p_data = {
+                "id": pid,
+                "title": item.get('title', ''),
+                "summary": item.get('summary', ''),
+                "pdf_url": f"https://arxiv.org/pdf/{pid}.pdf",
+                "arxiv_url": f"https://arxiv.org/abs/{pid}",
+                "hf_url": f"https://huggingface.co/papers/{pid}",
+                "source": "Hugging Face (Ranking)",
+                "published_date": pub_str[:10],
+                "github_url": "",
+                "journal_ref": "",
+                "comment": "",
+                "upvotes": item.get('upvotes', 0)
+            }
+            
+            if days_ago <= 7:
+                weekly_papers.append(p_data)
+            if days_ago <= 30:
+                monthly_papers.append(p_data)
+        
+        # いいね数（upvotes）順にソート
+        weekly_papers.sort(key=lambda x: x['upvotes'], reverse=True)
+        monthly_papers.sort(key=lambda x: x['upvotes'], reverse=True)
+        
+        selected_backup = []
+        
+        # 1. 週間ランキング上位10位以内から未読を探索
+        for p in weekly_papers[:10]:
+            if p['id'] not in history:
+                selected_backup.append(p)
+                if len(selected_backup) >= 2: break
+                
+        # 2. 足りなければ月間ランキング上位15位以内から未読を探索
+        if len(selected_backup) < 2:
+            for p in monthly_papers[:15]:
+                if p['id'] not in history and p['id'] not in [x['id'] for x in selected_backup]:
+                    selected_backup.append(p)
+                    if len(selected_backup) >= 2: break
+                    
+        return selected_backup
+    except Exception as e:
+        print(f"HF Ranking Fetch Error: {e}")
         return []
 
 def get_arxiv_papers():
@@ -163,23 +231,39 @@ def main():
     all_papers = hf + ar
     new_papers = [p for p in all_papers if p['id'] not in history]
     
+    is_fallback = False
     if not new_papers:
-        today = datetime.now().strftime('%Y-%m-%d')
-        no_paper_msg = f"📅 **{today} 厳選AI論文リスト**\n本日新しく公表された（未読の）論文はありませんでした。"
-        requests.post(DISCORD_URL, json={"content": no_paper_msg})
-        print("No new papers found since last run. Notification sent to Discord.")
-        return
+        print("No new daily papers found. Checking Hugging Face rankings as fallback...")
+        new_papers = get_hf_ranking_papers(history)
+        if new_papers:
+            is_fallback = True
+            print(f"Found {len(new_papers)} ranking papers for fallback.")
+        else:
+            # ランキングにも未読が全くない場合
+            today = datetime.now().strftime('%Y-%m-%d')
+            no_paper_msg = f"📅 **{today} 厳選AI論文リスト**\n本日新しく公表された論文、および過去のランキング（週間10位/月間15位以内）に対象となる未読論文はありませんでした。"
+            requests.post(DISCORD_URL, json={"content": no_paper_msg})
+            print("No new papers and no ranking papers found. Notification sent to Discord.")
+            return
 
-    print(f"Processing {len(new_papers)} new papers...")
+    print(f"Processing {len(new_papers)} papers...")
 
-    prompt = f"""
-    あなたはAIリサーチの専門家です。以下の論文リストから厳選し、指定のJSON配列形式でのみ出力してください。
-    原則として【4本】を選出しますが、データ内に「Survey論文（サーベイ、レビュー、包括的な解説論文）」が含まれている場合は、それらを最優先で追加し【最大5本】まで選出枠を広げてください。
+    # 通常時と補填時でルールを動的に切り替え
+    if is_fallback:
+        selection_rule = f"""リストにある【すべて（{len(new_papers)}本）】を必ず解析し、指定のJSON配列形式でのみ出力してください。
+    これは新着がない場合の過去のランキングからの補填処理です。選出数の変更（絞り込みや追加）はせず、与えられたデータをそのまま和訳・要約してください。"""
+    else:
+        selection_rule = """原則として【4本】を選出しますが、データ内に「Survey論文（サーベイ、レビュー、包括的な解説論文）」が含まれている場合は、それらを最優先で追加し【最大5本】まで選出枠を広げてください。
     
     【厳守ルール】
     1. タイトルや要約に 'survey', 'review', 'overview', 'comprehensive study' などの文言が含まれる「Survey論文」があれば、通常の選定（4本）に加えて1枠追加し、合計最大5本として必ず出力に含めてください。Survey論文がない場合は、通常通り4本にしてください。
     2. sourceが'Hugging Face'のものを【必ず2本以上】選んでください。
-    3. arXivは大手企業や有名学会のものを優先してください。
+    3. arXivは大手企業や有名学会のものを優先してください。"""
+
+    prompt = f"""
+    あなたはAIリサーチの専門家です。以下の論文リストから厳選し、指定のJSON配列形式でのみ出力してください。
+    
+    {selection_rule}
     4. JSON以外の説明、挨拶、コードブロック(```json等)は一切不要です。
     5. 出力テキストは指定がない限り【日本語】で行ってください。
 
@@ -262,10 +346,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # エラーの最終行（例外の型と原因メッセージ）だけを抽出
         error_reason = "".join(traceback.format_exception_only(type(e), e)).strip()
-        
-        # 特殊文字やクォーテーションの連続によるパースエラーを完全に防ぐ安全な結合
         msg_parts = [
             "🚨 **プログラム実行エラーが発生しました**",
             "```",
