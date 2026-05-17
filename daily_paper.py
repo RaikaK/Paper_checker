@@ -265,9 +265,14 @@ if __name__ == "__main__":
         # エラーの最終行（例外の型と原因メッセージ）だけを抽出
         error_reason = "".join(traceback.format_exception_only(type(e), e)).strip()
         
-        # コピペ時の物理改行エラーを防ぐため、f-stringを使わず安全に結合
-        error_msg = "🚨 **プログラム実行エラーが発生しました**\n```\n" + error_reason + "\n
-```"
+        # 特殊文字やクォーテーションの連続によるパースエラーを完全に防ぐ安全な結合
+        msg_parts = [
+            "🚨 **プログラム実行エラーが発生しました**",
+            "```",
+            error_reason,
+            "```"
+        ]
+        error_msg = "\n".join(msg_parts)
         print(error_msg)
         
         if DISCORD_URL:
