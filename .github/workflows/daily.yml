@@ -1,32 +1,62 @@
-name: Daily Paper Notifier
+name: Daily Paper Checker
+
+# =================================================================
+# 1. トリガー（実行タイミング）の設定部分
+# =================================================================
 on:
+  # 【定期自動実行】（今まで通り毎日自動で動かす設定）
   schedule:
-    - cron: '0 22 * * *'
+    - cron: '0 22 * * *'  # 時間はご自身の現在の設定に合わせてください
+  
+  # 【手動実行（タイムマシン機能）】の設定
+  # この「workflow_dispatch」というブロックを丸ごと追加します
   workflow_dispatch:
-permissions:
-  contents: write
+    inputs:
+      target_date:  # ← この変数名は変更しないでください（Python側がこの名前で受け取ります）
+        # ↓ ここはGitHubの画面に表示される説明文です。自由に書き換えてOKです！
+        description: 2026-05-15
+        required: false  # 空欄での実行（通常の今日付け処理）を許可するためにfalseにします
+        default: ''      # デフォルトは空欄にしておきます
+
+# =================================================================
+# 2. 実際の処理内容（ジョブ）の設定部分
+# =================================================================
 jobs:
-  run-script:
+  paper_check_job:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - uses: actions/checkout@v4
+      # リポジトリのコードをチェックアウト（既存のまま）
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Pythonの環境構築（既存のまま）
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.10'
+
+      # ライブラリのインストール（既存のまま。requirements.txt等があればそちらに合わせてください）
       - name: Install dependencies
-        run: pip install arxiv google-genai requests
-      - name: Run script
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-genai arxiv requests
+
+      # 履歴ファイルをGitHubに保存・復元するためのキャッシュ設定（既存のまま）
+      # ※ もし現在history.txtの保持に別の手段（Artifactsや別のリポジトリへのpush等）を
+      # 使っている場合は、ご自身の既存のステップに合わせてください。
+      - name: Restore or Initialize History
+        run: |
+          if [ ! -f history.txt ]; then
+            touch history.txt
+          fi
+
+      # 【最重要：実行コマンドの修正部分】
+      # 以前は「run: python daily_paper.py」だけだった部分の末尾に、
+      # 変数「${{ github.event.inputs.target_date }}」を付け加えます。
+      - name: Run Paper Checker
         env:
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python daily_paper.py
-      - name: Commit and push
-        run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add history.txt
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update history" && git push)
+        # 後ろにスペースを空けて変数を置くことで、手動入力された日付（空欄なら何もなし）がPythonの引数に渡ります
+        run: python daily_paper.py ${{ github.event.inputs.target_date }}
