@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import arxiv
 from google import genai
 import requests
+import argparse
 
 # --- 設定 ---
 GEMINI_KEY = os.getenv("GEMINI_API_KEY_2")
@@ -24,7 +25,6 @@ client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 arxiv_client = arxiv.Client()
 
 def extract_github_url(text):
-    """テキスト内からGitHubのURLを探して返す"""
     if not text:
         return ""
     match = re.search(r"https?://github\.com/[^\s,\]\)]+", text)
@@ -47,11 +47,22 @@ def manage_history():
                         except: continue
     return valid_history
 
-def get_hf_papers():
+def get_hf_papers(target_date_str=None):
+    """
+    指定された日付（なければ今日）のHugging Face Daily Papersを取得し、
+    Upvotes（いいね数）が多い順にソートして返す。
+    """
     try:
-        print("Fetching from Hugging Face Daily...")
-        res = requests.get("https://huggingface.co/api/daily_papers", timeout=15)
+        url = "https://huggingface.co/api/daily_papers"
+        if target_date_str:
+            url += f"?date={target_date_str}"
+            print(f"Fetching from Hugging Face Daily for {target_date_str}...")
+        else:
+            print("Fetching from Hugging Face Daily (Today)...")
+            
+        res = requests.get(url, timeout=15)
         res.raise_for_status()
+        
         papers = []
         for i in res.json():
             p = i['paper']
@@ -67,15 +78,18 @@ def get_hf_papers():
                 "published_date": pub_date,
                 "github_url": "",
                 "journal_ref": "",
-                "comment": ""
+                "comment": "",
+                "upvotes": p.get('upvotes', 0) # Upvote数を確保
             })
+            
+        # Upvotesの降順（多い順）でソート
+        papers.sort(key=lambda x: x['upvotes'], reverse=True)
         return papers
     except Exception as e:
         print(f"HF Fetch Error: {e}")
         return []
 
 def get_hf_ranking_papers(history):
-    """新着がない場合のフォールバック：週間10位以内、月間15位以内から未読を補填"""
     try:
         print("Fetching ranking papers from Hugging Face...")
         res = requests.get("https://huggingface.co/api/papers?sort=upvotes&limit=100", timeout=15)
@@ -89,11 +103,12 @@ def get_hf_ranking_papers(history):
             pid = item.get('id')
             if not pid: continue
             
-            pub_str = item.get('publishedAt')
+            pub_str = item.get('publishedAt') or item.get('date')
             if not pub_str: continue
             
             try:
-                pub_date = datetime.fromisoformat(pub_str.replace('Z', '+00:00'))
+                date_part = pub_str[:10]
+                pub_date = datetime.strptime(date_part, '%Y-%m-%d').replace(tzinfo=timezone.utc)
             except: continue
             
             days_ago = (now - pub_date).days
@@ -106,7 +121,7 @@ def get_hf_ranking_papers(history):
                 "arxiv_url": f"https://arxiv.org/abs/{pid}",
                 "hf_url": f"https://huggingface.co/papers/{pid}",
                 "source": "Hugging Face (Ranking)",
-                "published_date": pub_str[:10],
+                "published_date": date_part,
                 "github_url": "",
                 "journal_ref": "",
                 "comment": "",
@@ -118,19 +133,16 @@ def get_hf_ranking_papers(history):
             if days_ago <= 30:
                 monthly_papers.append(p_data)
         
-        # いいね数（upvotes）順にソート
         weekly_papers.sort(key=lambda x: x['upvotes'], reverse=True)
         monthly_papers.sort(key=lambda x: x['upvotes'], reverse=True)
         
         selected_backup = []
         
-        # 1. 週間ランキング上位10位以内から未読を探索
         for p in weekly_papers[:10]:
             if p['id'] not in history:
                 selected_backup.append(p)
                 if len(selected_backup) >= 2: break
                 
-        # 2. 足りなければ月間ランキング上位15位以内から未読を探索
         if len(selected_backup) < 2:
             for p in monthly_papers[:15]:
                 if p['id'] not in history and p['id'] not in [x['id'] for x in selected_backup]:
@@ -223,9 +235,11 @@ def parse_json_from_text(text):
         print(f"JSON Parse Error: {e}")
     return None
 
-def main():
+def main(target_date=None):
     history = manage_history()
-    hf = get_hf_papers()
+    
+    # ターゲット日付が指定されていればHFに渡し、なければNone（今日）
+    hf = get_hf_papers(target_date)
     ar = get_arxiv_papers()
     
     all_papers = hf + ar
@@ -239,8 +253,7 @@ def main():
             is_fallback = True
             print(f"Found {len(new_papers)} ranking papers for fallback.")
         else:
-            # ランキングにも未読が全くない場合
-            today = datetime.now().strftime('%Y-%m-%d')
+            today = target_date if target_date else datetime.now().strftime('%Y-%m-%d')
             no_paper_msg = f"📅 **{today} 厳選AI論文リスト**\n本日新しく公表された論文、および過去のランキング（週間10位/月間15位以内）に対象となる未読論文はありませんでした。"
             requests.post(DISCORD_URL, json={"content": no_paper_msg})
             print("No new papers and no ranking papers found. Notification sent to Discord.")
@@ -248,7 +261,6 @@ def main():
 
     print(f"Processing {len(new_papers)} papers...")
 
-    # 通常時と補填時でルールを動的に切り替え
     if is_fallback:
         selection_rule = f"""リストにある【すべて（{len(new_papers)}本）】を必ず解析し、指定のJSON配列形式でのみ出力してください。
     これは新着がない場合の過去のランキングからの補填処理です。選出数の変更（絞り込みや追加）はせず、与えられたデータをそのまま和訳・要約してください。"""
@@ -257,7 +269,7 @@ def main():
     
     【厳守ルール】
     1. タイトルや要約に 'survey', 'review', 'overview', 'comprehensive study' などの文言が含まれる「Survey論文」があれば、通常の選定（4本）に加えて1枠追加し、合計最大5本として必ず出力に含めてください。Survey論文がない場合は、通常通り4本にしてください。
-    2. sourceが'Hugging Face'のものを【必ず2本以上】選んでください。
+    2. sourceが'Hugging Face'のものを【必ず2本以上】選んでください。なお、データはHugging FaceのUpvotes（いいね数）が多い順に並んでいます。
     3. arXivは大手企業や有名学会のものを優先してください。"""
 
     prompt = f"""
@@ -272,6 +284,7 @@ def main():
 
     [
       {{
+        "id": "データ内の id をそのまま正確に転記してください。ここが空欄になるとシステムが壊れます",
         "title_ja": "タイトル(日本語和訳)",
         "title_en": "元の英語タイトル",
         "pdf_url": "論文PDFのURL",
@@ -302,10 +315,10 @@ def main():
     selected = parse_json_from_text(report_text)
     
     if selected:
-        today = datetime.now().strftime('%Y-%m-%d')
+        today = target_date if target_date else datetime.now().strftime('%Y-%m-%d')
         header = f"📅 **{today} 厳選AI論文リスト**\n"
         for i, p in enumerate(selected, 1):
-            header += f"{i}. {p['title_ja']} / {p['title_en']} ({p['source']})\n"
+            header += f"{i}. {p.get('title_ja', '無題')} / {p.get('title_en', 'Untitled')} ({p.get('source', 'Unknown')})\n"
         requests.post(DISCORD_URL, json={"content": header})
         
         time.sleep(1)
@@ -315,25 +328,28 @@ def main():
             hf_info = f"🤗 Hugging Face: {p['hf_url']}\n" if p.get('hf_url') else ""
             
             msg = (
-                f"📄 **{p['title_ja']}**\n"
-                f"🔤 原題: {p['title_en']}\n"
+                f"📄 **{p.get('title_ja', '無題')}**\n"
+                f"🔤 原題: {p.get('title_en', 'Untitled')}\n"
                 f"📅 公開日: {p.get('published_date', '不明')} | 🛡️ 査読: {p.get('peer_review_status', 'Preprint（査読未定）')}\n"
                 f"🔗 arXiv Abs: {p.get('arxiv_url', '不明')}\n"
                 f"📕 PDF: {p.get('pdf_url', '不明')}\n"
                 f"{hf_info}"
                 f"{git_info}"
-                f"🏢 Source: {p['source']}\n"
-                f"📝 要約: {p['summary']}\n"
-                f"🏷️ タグ: {', '.join(p['tags'])}\n"
-                f"💡 ポイント: {p['layman_point']}\n"
-                f"⭐ 興味深さ: {p['interest_score']}/10 | 🛠️ 汎用性: {p['applicability_score']}/10\n"
+                f"🏢 Source: {p.get('source', 'Unknown')}\n"
+                f"📝 要約: {p.get('summary', '要約なし短評')}\n"
+                f"🏷️ タグ: {', '.join(p.get('tags', []))}\n"
+                f"💡 ポイント: {p.get('layman_point', 'なし')}\n"
+                f"⭐ 興味深さ: {p.get('interest_score', 0)}/10 | 🛠️ 汎用性: {p.get('applicability_score', 0)}/10\n"
                 f"--------------------------------------------"
             )
             requests.post(DISCORD_URL, json={"content": msg})
             time.sleep(1)
         
         now_s = datetime.now(timezone.utc).isoformat()
-        for p in new_papers: history[p['id']] = now_s
+        for p in selected:
+            if p.get('id'):
+                history[p['id']] = now_s
+                
         with open(HISTORY_FILE, "w") as f:
             for pid, ts in history.items(): f.write(f"{pid}|{ts}\n")
         print("All processes finished successfully.")
@@ -344,7 +360,18 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        # コマンドライン引数から日付（YYYY-MM-DD）を取得。なければNone
+        parser = argparse.ArgumentParser(description="Daily Paper Checker")
+        parser.add_argument("date", nargs="?", default=None, help="Target date in YYYY-MM-DD format (optional)")
+        args = parser.parse_args()
+        
+        # もし日付のフォーマットチェックをしたい場合はここで validate しても良いです
+        if args.date and not re.match(r"^\d{4}-\d{2}-\d{2}$", args.date):
+            print("Error: Date format must be YYYY-MM-DD")
+            sys.exit(1)
+
+        main(target_date=args.date)
+        
     except Exception as e:
         error_reason = "".join(traceback.format_exception_only(type(e), e)).strip()
         msg_parts = [
