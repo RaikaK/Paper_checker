@@ -95,8 +95,7 @@ def get_hf_papers(target_date_str=None):
                 "published_date": pub_date,
                 "github_url": "",
                 "journal_ref": "",
-                "comment": "",
-                "upvotes": p.get('upvotes', 0)
+                "comment": ""
             })
             
         papers.sort(key=lambda x: x['upvotes'], reverse=True)
@@ -144,8 +143,7 @@ def get_hf_monthly_backup(history, count=3, exclude_ids=None):
                     "published_date": date_part,
                     "github_url": "",
                     "journal_ref": "",
-                    "comment": "",
-                    "upvotes": item.get('upvotes', 0)
+                    "comment": ""
                 })
         
         monthly_papers.sort(key=lambda x: x['upvotes'], reverse=True)
@@ -155,9 +153,9 @@ def get_hf_monthly_backup(history, count=3, exclude_ids=None):
         return []
 
 def get_arxiv_papers():
+    """【修正】学会名や企業名の縛りを無くし、純粋に指定カテゴリの最新論文を確実に取得する"""
     print("Fetching from arXiv...")
-    keywords = '(CVPR OR NeurIPS OR ICLR OR ICML OR ACL OR Google OR Meta OR OpenAI OR NVIDIA OR DeepMind OR Microsoft)'
-    query = f'({keywords}) AND (cat:cs.AI OR cat:cs.LG OR cat:cs.CL)'
+    query = 'cat:cs.AI OR cat:cs.LG OR cat:cs.CL'
     search = arxiv.Search(query=query, max_results=30, sort_by=arxiv.SortCriterion.SubmittedDate)
     try:
         results = list(arxiv_client.results(search))
@@ -175,7 +173,7 @@ def get_arxiv_papers():
                 "pdf_url": r.pdf_url,
                 "arxiv_url": f"https://arxiv.org/abs/{pid}",
                 "hf_url": "",
-                "source": "arXiv (Top Tier)",
+                "source": "arXiv (Latest)",
                 "published_date": r.published.strftime('%Y-%m-%d'),
                 "github_url": git_url,
                 "journal_ref": r.journal_ref or "",
@@ -242,16 +240,17 @@ def main(target_date=None):
     
     final_papers = []
     survey_paper = None
+    chosen_ids = []
     
     # 1. 完全新着なしモード：月間ランキングから未読3本を取得
     if not hf_new and not ar_new:
         print("No new papers found. Fetching Monthly Top papers...")
-        # Surveyを探すために少し多めの15本を候補として取得
         backup_candidates = get_hf_monthly_backup(history, count=15)
         if backup_candidates:
-            # 通常枠として上位3本を採択
             final_papers = backup_candidates[:3]
-            # 4本目以降にSurvey論文があれば1本だけ追加枠として確保
+            chosen_ids = [p['id'] for p in final_papers]
+            
+            # 4本目以降にSurvey論文があれば追加枠にする
             for p in backup_candidates[3:]:
                 if is_survey_paper(p['title'], p['summary']):
                     survey_paper = p
@@ -263,36 +262,46 @@ def main(target_date=None):
             return
     else:
         # 2. 新着ありモード：基本HF 2本 + arXiv 2本 = 計4本
-        hf_needed = 2
-        ar_needed = 2
+        # 【強化】HFとarXiv間で同じ論文が重複して選ばれないよう厳密にID管理
+        hf_candidates = hf_new[:2]
+        chosen_ids = [p['id'] for p in hf_candidates]
         
-        if len(hf_new) < hf_needed:
-            hf_needed = len(hf_new)
-            ar_needed = 4 - hf_needed
-        elif len(ar_new) < ar_needed:
-            ar_needed = len(ar_new)
-            hf_needed = 4 - ar_needed
+        # arXiv側からは、既読でなく、かつ今回選んだHFとも被っていないものを上から2本確保
+        ar_candidates = [p for p in ar_new if p['id'] not in chosen_ids][:2]
+        chosen_ids.extend([p['id'] for p in ar_candidates])
+        
+        final_papers.extend(hf_candidates)
+        final_papers.extend(ar_candidates)
+        
+        # 万が一、どちらかが新着不足で合計4本に満たない場合は、新着の残りで枠を埋める
+        if len(final_papers) < 4:
+            remaining_hf = [p for p in hf_new if p['id'] not in chosen_ids]
+            remaining_ar = [p for p in ar_new if p['id'] not in chosen_ids]
             
-        final_papers.extend(hf_new[:hf_needed])
-        final_papers.extend(ar_new[:ar_needed])
+            for p in remaining_hf:
+                if len(final_papers) >= 4: break
+                final_papers.append(p)
+                chosen_ids.append(p['id'])
+            for p in remaining_ar:
+                if len(final_papers) >= 4: break
+                final_papers.append(p)
+                chosen_ids.append(p['id'])
         
+        # それでも4本に満たない場合は月間ランキングから補填
         if len(final_papers) < 4:
             deficit = 4 - len(final_papers)
-            exclude = [p['id'] for p in final_papers]
-            backup = get_hf_monthly_backup(history, count=deficit, exclude_ids=exclude)
+            backup = get_hf_monthly_backup(history, count=deficit, exclude_ids=chosen_ids)
             final_papers.extend(backup)
+            chosen_ids.extend([p['id'] for p in backup])
             
         # --- Survey論文の追加枠チェック ---
-        # まだ選ばれていない（final_papersに入っていない）残りの新着論文からSurveyを探す
-        chosen_ids = [p['id'] for p in final_papers]
-        remaining_new_papers = [p for p in (hf_new + ar_new) if p['id'] not in chosen_ids]
-        
-        for p in remaining_new_papers:
+        # まだ選ばれていない（final_papersに入っていない）残りのすべての新着論文からSurveyを探す
+        remaining_all_new = [p for p in (hf_new + ar_new) if p['id'] not in chosen_ids]
+        for p in remaining_all_new:
             if is_survey_paper(p['title'], p['summary']):
                 survey_paper = p
                 break
 
-    # Survey論文が見つかっていれば、+1枠として末尾に追加
     if survey_paper:
         print(f"Found a survey paper! Adding as extra slot: {survey_paper['title']}")
         survey_paper['source'] += " (Survey枠)"
@@ -306,11 +315,10 @@ def main(target_date=None):
             "index": idx,
             "title": p['title'],
             "summary": p['summary'],
-            "source": p['source'],
-            "comment": p['comment'],
-            "journal_ref": p['journal_ref']
+            "source": p['source']
         })
 
+    # 【修正】査読ステータスの項目をプロンプトから完全に削除
     prompt = f"""
     あなたはAIリサーチの専門家です。提示されたすべての論文について、指定のJSON配列形式でのみ翻訳・解説を出力してください。
     選別の必要はありません。提供された【すべてのインデックス】を網羅してください。JSON以外の文章は一切不要です。
@@ -320,7 +328,6 @@ def main(target_date=None):
         "index": 0,
         "title_ja": "タイトル(日本語和訳)",
         "title_en": "元の英語タイトル",
-        "peer_review_status": "査読ステータス（『査読あり（学会名）』または『Preprint（査読未定）』）",
         "summary": "技術的な要約(日本語で3行程度)",
         "tags": ["タグ1", "タグ2"],
         "layman_point": "専門外の人でも凄さがわかるポイント(日本語)",
@@ -348,24 +355,23 @@ def main(target_date=None):
             if idx is not None and idx < len(final_papers):
                 valid_selected.append((final_papers[idx], item))
         
-        # ヘッダー送信
         header = f"📅 **{today} 厳選AI論文リスト**\n"
         for i, (orig, ai) in enumerate(valid_selected, 1):
             header += f"{i}. {ai.get('title_ja', orig['title'])} ({orig['source']})\n"
         requests.post(DISCORD_URL, json={"content": header})
         time.sleep(1)
 
-        # 各論文の詳細送信
         now_s = datetime.now(timezone.utc).isoformat()
         for orig, ai in valid_selected:
             git_info = f"💻 GitHub: {orig['github_url']}\n" if orig['github_url'] else ""
             hf_info = f"🤗 Hugging Face: {orig['hf_url']}\n" if orig['hf_url'] else ""
             
+            # 【修正】「🛡️ 査読」の行を完全に削除
             msg = (
-                f"--------------------------------------------"
+                f"--------------------------------------------\n"
                 f"📄 **{ai.get('title_ja', orig['title'])}**\n"
                 f"🔤 原題: {ai.get('title_en', orig['title'])}\n"
-                f"📅 公開日: {orig['published_date']} | 🛡️ 査読: {ai.get('peer_review_status', 'Preprint（査読未定）')}\n"
+                f"📅 公開日: {orig['published_date']}\n"
                 f"🔗 arXiv Abs: {orig['arxiv_url']}\n"
                 f"📕 PDF: {orig['pdf_url']}\n"
                 f"{hf_info}{git_info}"
@@ -377,7 +383,6 @@ def main(target_date=None):
             )
             requests.post(DISCORD_URL, json={"content": msg})
             
-            # 【確実な履歴保存】送信が確定した論文のみ履歴に登録
             history[orig['id']] = now_s
             time.sleep(1)
         
@@ -400,10 +405,7 @@ if __name__ == "__main__":
         main(target_date=args.date)
     except Exception as e:
         error_reason = "".join(traceback.format_exception_only(type(e), e)).strip()
-        
-        # バックティック「`」の連続によるパースエラーを根絶するため、文字コードから生成
         ticks = chr(96) * 3
-        
         msg_parts = [
             "🚨 **プログラム実行エラーが発生しました**",
             ticks,
@@ -411,9 +413,6 @@ if __name__ == "__main__":
             ticks
         ]
         error_msg = "\n".join(msg_parts)
-        
         if DISCORD_URL:
-            try: 
-                requests.post(DISCORD_URL, json={"content": error_msg})
-            except: 
-                pass
+            try: requests.post(DISCORD_URL, json={"content": error_msg})
+            except: pass
