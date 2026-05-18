@@ -400,9 +400,20 @@ if __name__ == "__main__":
         main(target_date=args.date)
     except Exception as e:
         error_reason = "".join(traceback.format_exception_only(type(e), e)).strip()
-        msg_parts = ["🚨 **プログラム実行エラーが発生しました**", "```", error_reason, "
-```"]
+        
+        # バックティック「`」の連続によるパースエラーを根絶するため、文字コードから生成
+        ticks = chr(96) * 3
+        
+        msg_parts = [
+            "🚨 **プログラム実行エラーが発生しました**",
+            ticks,
+            error_reason,
+            ticks
+        ]
         error_msg = "\n".join(msg_parts)
+        
         if DISCORD_URL:
-            try: requests.post(DISCORD_URL, json={"content": error_msg})
-            except: pass
+            try: 
+                requests.post(DISCORD_URL, json={"content": error_msg})
+            except: 
+                pass
