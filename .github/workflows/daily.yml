@@ -14,7 +14,7 @@ on:
     inputs:
       target_date:  # ← この変数名は変更しないでください（Python側がこの名前で受け取ります）
         # ↓ ここはGitHubの画面に表示される説明文です。自由に書き換えてOKです！
-        description: 2026-05-15
+        description: '2026-05-15'
         required: false  # 空欄での実行（通常の今日付け処理）を許可するためにfalseにします
         default: ''      # デフォルトは空欄にしておきます
 
