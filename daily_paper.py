@@ -24,6 +24,24 @@ if not DISCORD_URL:
 client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 arxiv_client = arxiv.Client()
 
+def clean_id(raw_id):
+    """arXiv IDの末尾にあるバージョン情報(v1, v2など)を削除してIDを統一する"""
+    if not raw_id:
+        return ""
+    return re.sub(r'v\d+$', '', raw_id.strip())
+
+def is_benchmark_paper(title, summary):
+    """ベンチマークやデータセット系の論文を判定して除外する"""
+    blacklist = ['benchmark', 'dataset', 'evaluation', 'leaderboard', 'benchmarks', 'datasets']
+    text = f"{title} {summary}".lower()
+    return any(word in text for word in blacklist)
+
+def is_survey_paper(title, summary):
+    """Survey（包括的な解説・レビュー）論文かどうかを判定する"""
+    keywords = ['survey', 'review', 'overview', 'comprehensive study']
+    text = f"{title} {summary}".lower()
+    return any(word in text for word in keywords)
+
 def extract_github_url(text):
     if not text:
         return ""
@@ -43,65 +61,68 @@ def manage_history():
                         try:
                             ts = datetime.fromisoformat(ts_str)
                             if now - ts < timedelta(days=RETENTION_DAYS):
-                                valid_history[pid] = ts_str
+                                valid_history[clean_id(pid)] = ts_str
                         except: continue
     return valid_history
 
 def get_hf_papers(target_date_str=None):
-    """
-    指定された日付（なければ今日）のHugging Face Daily Papersを取得し、
-    Upvotes（いいね数）が多い順にソートして返す。
-    """
     try:
         url = "https://huggingface.co/api/daily_papers"
         if target_date_str:
             url += f"?date={target_date_str}"
-            print(f"Fetching from Hugging Face Daily for {target_date_str}...")
-        else:
-            print("Fetching from Hugging Face Daily (Today)...")
-            
         res = requests.get(url, timeout=15)
         res.raise_for_status()
         
         papers = []
         for i in res.json():
             p = i['paper']
+            pid = clean_id(p['id'])
+            title = p.get('title', '')
+            summary = p.get('summary', '')
+            
+            if is_benchmark_paper(title, summary):
+                continue
+                
             pub_date = p.get('publishedAt', datetime.now().isoformat())[:10]
             papers.append({
-                "id": p['id'],
-                "title": p['title'],
-                "summary": p.get('summary', ''),
-                "pdf_url": f"https://arxiv.org/pdf/{p['id']}.pdf",
-                "arxiv_url": f"https://arxiv.org/abs/{p['id']}",
-                "hf_url": f"https://huggingface.co/papers/{p['id']}",
+                "id": pid,
+                "title": title,
+                "summary": summary,
+                "pdf_url": f"https://arxiv.org/pdf/{pid}.pdf",
+                "arxiv_url": f"https://arxiv.org/abs/{pid}",
+                "hf_url": f"https://huggingface.co/papers/{pid}",
                 "source": "Hugging Face",
                 "published_date": pub_date,
                 "github_url": "",
                 "journal_ref": "",
                 "comment": "",
-                "upvotes": p.get('upvotes', 0) # Upvote数を確保
+                "upvotes": p.get('upvotes', 0)
             })
             
-        # Upvotesの降順（多い順）でソート
         papers.sort(key=lambda x: x['upvotes'], reverse=True)
         return papers
     except Exception as e:
         print(f"HF Fetch Error: {e}")
         return []
 
-def get_hf_ranking_papers(history):
+def get_hf_monthly_backup(history, count=3, exclude_ids=None):
+    if exclude_ids is None:
+        exclude_ids = []
     try:
-        print("Fetching ranking papers from Hugging Face...")
+        print(f"Fetching monthly ranking papers (up to {count} candidates) from Hugging Face...")
         res = requests.get("https://huggingface.co/api/papers?sort=upvotes&limit=100", timeout=15)
         res.raise_for_status()
         
         now = datetime.now(timezone.utc)
-        weekly_papers = []
         monthly_papers = []
         
         for item in res.json():
-            pid = item.get('id')
-            if not pid: continue
+            pid = clean_id(item.get('id'))
+            if not pid or pid in history or pid in exclude_ids: continue
+            
+            title = item.get('title', '')
+            summary = item.get('summary', '')
+            if is_benchmark_paper(title, summary): continue
             
             pub_str = item.get('publishedAt') or item.get('date')
             if not pub_str: continue
@@ -111,59 +132,41 @@ def get_hf_ranking_papers(history):
                 pub_date = datetime.strptime(date_part, '%Y-%m-%d').replace(tzinfo=timezone.utc)
             except: continue
             
-            days_ago = (now - pub_date).days
-            
-            p_data = {
-                "id": pid,
-                "title": item.get('title', ''),
-                "summary": item.get('summary', ''),
-                "pdf_url": f"https://arxiv.org/pdf/{pid}.pdf",
-                "arxiv_url": f"https://arxiv.org/abs/{pid}",
-                "hf_url": f"https://huggingface.co/papers/{pid}",
-                "source": "Hugging Face (Ranking)",
-                "published_date": date_part,
-                "github_url": "",
-                "journal_ref": "",
-                "comment": "",
-                "upvotes": item.get('upvotes', 0)
-            }
-            
-            if days_ago <= 7:
-                weekly_papers.append(p_data)
-            if days_ago <= 30:
-                monthly_papers.append(p_data)
+            if (now - pub_date).days <= 30:
+                monthly_papers.append({
+                    "id": pid,
+                    "title": title,
+                    "summary": summary,
+                    "pdf_url": f"https://arxiv.org/pdf/{pid}.pdf",
+                    "arxiv_url": f"https://arxiv.org/abs/{pid}",
+                    "hf_url": f"https://huggingface.co/papers/{pid}",
+                    "source": "Hugging Face (Monthly Top)",
+                    "published_date": date_part,
+                    "github_url": "",
+                    "journal_ref": "",
+                    "comment": "",
+                    "upvotes": item.get('upvotes', 0)
+                })
         
-        weekly_papers.sort(key=lambda x: x['upvotes'], reverse=True)
         monthly_papers.sort(key=lambda x: x['upvotes'], reverse=True)
-        
-        selected_backup = []
-        
-        for p in weekly_papers[:10]:
-            if p['id'] not in history:
-                selected_backup.append(p)
-                if len(selected_backup) >= 2: break
-                
-        if len(selected_backup) < 2:
-            for p in monthly_papers[:15]:
-                if p['id'] not in history and p['id'] not in [x['id'] for x in selected_backup]:
-                    selected_backup.append(p)
-                    if len(selected_backup) >= 2: break
-                    
-        return selected_backup
+        return monthly_papers[:count]
     except Exception as e:
-        print(f"HF Ranking Fetch Error: {e}")
+        print(f"HF Monthly Backup Fetch Error: {e}")
         return []
 
 def get_arxiv_papers():
     print("Fetching from arXiv...")
     keywords = '(CVPR OR NeurIPS OR ICLR OR ICML OR ACL OR Google OR Meta OR OpenAI OR NVIDIA OR DeepMind OR Microsoft)'
     query = f'({keywords}) AND (cat:cs.AI OR cat:cs.LG OR cat:cs.CL)'
-    search = arxiv.Search(query=query, max_results=20, sort_by=arxiv.SortCriterion.SubmittedDate)
+    search = arxiv.Search(query=query, max_results=30, sort_by=arxiv.SortCriterion.SubmittedDate)
     try:
         results = list(arxiv_client.results(search))
         papers = []
         for r in results:
-            pid = r.entry_id.split('/')[-1]
+            pid = clean_id(r.entry_id.split('/')[-1])
+            if is_benchmark_paper(r.title, r.summary):
+                continue
+                
             git_url = extract_github_url(r.comment) or extract_github_url(r.summary)
             papers.append({
                 "id": pid,
@@ -191,7 +194,6 @@ def call_llm(prompt):
         "openai/gpt-oss-120b:free",
         "deepseek/deepseek-r1:free"
     ]
-    
     if client:
         for m_name in ['gemini-2.0-flash', 'gemini-1.5-flash']:
             try:
@@ -200,7 +202,6 @@ def call_llm(prompt):
                 if res.text: return res.text
             except Exception as e:
                 print(f"Gemini {m_name} failed: {e}")
-
     if OPENROUTER_KEY:
         for m_id in models:
             try:
@@ -216,11 +217,7 @@ def call_llm(prompt):
                     if 'choices' in result:
                         content = result['choices'][0]['message']['content']
                         if content: return content
-                else:
-                    print(f"OpenRouter {m_id} error {resp.status_code}: {resp.text}")
-            except Exception as e:
-                print(f"OpenRouter {m_id} request failed: {e}")
-                continue
+            except: continue
     return None
 
 def parse_json_from_text(text):
@@ -229,8 +226,7 @@ def parse_json_from_text(text):
         start = text.find('[')
         end = text.rfind(']') + 1
         if start != -1 and end != 0:
-            json_str = text[start:end]
-            return json.loads(json_str)
+            return json.loads(text[start:end])
     except Exception as e:
         print(f"JSON Parse Error: {e}")
     return None
@@ -238,62 +234,93 @@ def parse_json_from_text(text):
 def main(target_date=None):
     history = manage_history()
     
-    # ターゲット日付が指定されていればHFに渡し、なければNone（今日）
-    hf = get_hf_papers(target_date)
-    ar = get_arxiv_papers()
+    hf_all = get_hf_papers(target_date)
+    ar_all = get_arxiv_papers()
     
-    all_papers = hf + ar
-    new_papers = [p for p in all_papers if p['id'] not in history]
+    hf_new = [p for p in hf_all if p['id'] not in history]
+    ar_new = [p for p in ar_all if p['id'] not in history]
     
-    is_fallback = False
-    if not new_papers:
-        print("No new daily papers found. Checking Hugging Face rankings as fallback...")
-        new_papers = get_hf_ranking_papers(history)
-        if new_papers:
-            is_fallback = True
-            print(f"Found {len(new_papers)} ranking papers for fallback.")
+    final_papers = []
+    survey_paper = None
+    
+    # 1. 完全新着なしモード：月間ランキングから未読3本を取得
+    if not hf_new and not ar_new:
+        print("No new papers found. Fetching Monthly Top papers...")
+        # Surveyを探すために少し多めの15本を候補として取得
+        backup_candidates = get_hf_monthly_backup(history, count=15)
+        if backup_candidates:
+            # 通常枠として上位3本を採択
+            final_papers = backup_candidates[:3]
+            # 4本目以降にSurvey論文があれば1本だけ追加枠として確保
+            for p in backup_candidates[3:]:
+                if is_survey_paper(p['title'], p['summary']):
+                    survey_paper = p
+                    break
         else:
             today = target_date if target_date else datetime.now().strftime('%Y-%m-%d')
-            no_paper_msg = f"📅 **{today} 厳選AI論文リスト**\n本日新しく公表された論文、および過去のランキング（週間10位/月間15位以内）に対象となる未読論文はありませんでした。"
+            no_paper_msg = f"📅 **{today} 厳選AI論文リスト**\n新しい論文、および月間ランキングに対象となる未読論文はありませんでした。"
             requests.post(DISCORD_URL, json={"content": no_paper_msg})
-            print("No new papers and no ranking papers found. Notification sent to Discord.")
             return
-
-    print(f"Processing {len(new_papers)} papers...")
-
-    if is_fallback:
-        selection_rule = f"""リストにある【すべて（{len(new_papers)}本）】を必ず解析し、指定のJSON配列形式でのみ出力してください。
-    これは新着がない場合の過去のランキングからの補填処理です。選出数の変更（絞り込みや追加）はせず、与えられたデータをそのまま和訳・要約してください。"""
     else:
-        selection_rule = """原則として【4本】を選出しますが、データ内に「Survey論文（サーベイ、レビュー、包括的な解説論文）」が含まれている場合は、それらを最優先で追加し【最大5本】まで選出枠を広げてください。
-    
-    【厳守ルール】
-    1. タイトルや要約に 'survey', 'review', 'overview', 'comprehensive study' などの文言が含まれる「Survey論文」があれば、通常の選定（4本）に加えて1枠追加し、合計最大5本として必ず出力に含めてください。Survey論文がない場合は、通常通り4本にしてください。
-    2. sourceが'Hugging Face'のものを【必ず2本以上】選んでください。なお、データはHugging FaceのUpvotes（いいね数）が多い順に並んでいます。
-    3. arXivは大手企業や有名学会のものを優先してください。"""
+        # 2. 新着ありモード：基本HF 2本 + arXiv 2本 = 計4本
+        hf_needed = 2
+        ar_needed = 2
+        
+        if len(hf_new) < hf_needed:
+            hf_needed = len(hf_new)
+            ar_needed = 4 - hf_needed
+        elif len(ar_new) < ar_needed:
+            ar_needed = len(ar_new)
+            hf_needed = 4 - ar_needed
+            
+        final_papers.extend(hf_new[:hf_needed])
+        final_papers.extend(ar_new[:ar_needed])
+        
+        if len(final_papers) < 4:
+            deficit = 4 - len(final_papers)
+            exclude = [p['id'] for p in final_papers]
+            backup = get_hf_monthly_backup(history, count=deficit, exclude_ids=exclude)
+            final_papers.extend(backup)
+            
+        # --- Survey論文の追加枠チェック ---
+        # まだ選ばれていない（final_papersに入っていない）残りの新着論文からSurveyを探す
+        chosen_ids = [p['id'] for p in final_papers]
+        remaining_new_papers = [p for p in (hf_new + ar_new) if p['id'] not in chosen_ids]
+        
+        for p in remaining_new_papers:
+            if is_survey_paper(p['title'], p['summary']):
+                survey_paper = p
+                break
+
+    # Survey論文が見つかっていれば、+1枠として末尾に追加
+    if survey_paper:
+        print(f"Found a survey paper! Adding as extra slot: {survey_paper['title']}")
+        survey_paper['source'] += " (Survey枠)"
+        final_papers.append(survey_paper)
+
+    print(f"Processing {len(final_papers)} papers with LLM...")
+
+    llm_input_data = []
+    for idx, p in enumerate(final_papers):
+        llm_input_data.append({
+            "index": idx,
+            "title": p['title'],
+            "summary": p['summary'],
+            "source": p['source'],
+            "comment": p['comment'],
+            "journal_ref": p['journal_ref']
+        })
 
     prompt = f"""
-    あなたはAIリサーチの専門家です。以下の論文リストから厳選し、指定のJSON配列形式でのみ出力してください。
-    
-    {selection_rule}
-    4. JSON以外の説明、挨拶、コードブロック(```json等)は一切不要です。
-    5. 出力テキストは指定がない限り【日本語】で行ってください。
-
-    【査読判定のヒント】
-    データ内の 'journal_ref' や 'comment' に学会名や「Accepted to ○○」といった記述がある場合は「査読あり（学会名）」、特に記載がなくプレプリント状態の場合は「Preprint（査読未定）」と判定してください。
+    あなたはAIリサーチの専門家です。提示されたすべての論文について、指定のJSON配列形式でのみ翻訳・解説を出力してください。
+    選別の必要はありません。提供された【すべてのインデックス】を網羅してください。JSON以外の文章は一切不要です。
 
     [
       {{
-        "id": "データ内の id をそのまま正確に転記してください。ここが空欄になるとシステムが壊れます",
+        "index": 0,
         "title_ja": "タイトル(日本語和訳)",
         "title_en": "元の英語タイトル",
-        "pdf_url": "論文PDFのURL",
-        "arxiv_url": "arXivの概要ページのURL",
-        "hf_url": "Hugging Faceの論文ページのURL (データ内にあればそのまま、なければ空文字)",
-        "github_url": "ソースコードのURL(あれば優先、なければ空文字)",
-        "published_date": "公開日(YYYY-MM-DD)",
-        "peer_review_status": "査読ステータス（例：『査読あり（CVPR 2026）』または『Preprint（査読未定）』）",
-        "source": "提供元",
+        "peer_review_status": "査読ステータス（『査読あり（学会名）』または『Preprint（査読未定）』）",
         "summary": "技術的な要約(日本語で3行程度)",
         "tags": ["タグ1", "タグ2"],
         "layman_point": "専門外の人でも凄さがわかるポイント(日本語)",
@@ -302,89 +329,80 @@ def main(target_date=None):
       }}
     ]
 
-    データ: {json.dumps(new_papers, ensure_ascii=False)}
+    データ: {json.dumps(llm_input_data, ensure_ascii=False)}
     """
     
     report_text = call_llm(prompt)
     if not report_text:
-        err_msg = "⚠️ **致命的エラー**: すべてのLLMモデルからの応答取得に失敗したため、本日の選出処理を中断しました。"
-        print(err_msg)
-        requests.post(DISCORD_URL, json={"content": err_msg})
+        requests.post(DISCORD_URL, json={"content": "⚠️ **致命的エラー**: AIモデルからの応答取得に失敗しました。"})
         return
 
-    selected = parse_json_from_text(report_text)
+    selected_results = parse_json_from_text(report_text)
     
-    if selected:
+    if selected_results:
         today = target_date if target_date else datetime.now().strftime('%Y-%m-%d')
-        header = f"📅 **{today} 厳選AI論文リスト**\n"
-        for i, p in enumerate(selected, 1):
-            header += f"{i}. {p.get('title_ja', '無題')} / {p.get('title_en', 'Untitled')} ({p.get('source', 'Unknown')})\n"
-        requests.post(DISCORD_URL, json={"content": header})
         
+        valid_selected = []
+        for item in selected_results:
+            idx = item.get('index')
+            if idx is not None and idx < len(final_papers):
+                valid_selected.append((final_papers[idx], item))
+        
+        # ヘッダー送信
+        header = f"📅 **{today} 厳選AI論文リスト**\n"
+        for i, (orig, ai) in enumerate(valid_selected, 1):
+            header += f"{i}. {ai.get('title_ja', orig['title'])} ({orig['source']})\n"
+        requests.post(DISCORD_URL, json={"content": header})
         time.sleep(1)
 
-        for p in selected:
-            git_info = f"💻 GitHub: {p['github_url']}\n" if p.get('github_url') else ""
-            hf_info = f"🤗 Hugging Face: {p['hf_url']}\n" if p.get('hf_url') else ""
+        # 各論文の詳細送信
+        now_s = datetime.now(timezone.utc).isoformat()
+        for orig, ai in valid_selected:
+            git_info = f"💻 GitHub: {orig['github_url']}\n" if orig['github_url'] else ""
+            hf_info = f"🤗 Hugging Face: {orig['hf_url']}\n" if orig['hf_url'] else ""
             
             msg = (
-                f"📄 **{p.get('title_ja', '無題')}**\n"
-                f"🔤 原題: {p.get('title_en', 'Untitled')}\n"
-                f"📅 公開日: {p.get('published_date', '不明')} | 🛡️ 査読: {p.get('peer_review_status', 'Preprint（査読未定）')}\n"
-                f"🔗 arXiv Abs: {p.get('arxiv_url', '不明')}\n"
-                f"📕 PDF: {p.get('pdf_url', '不明')}\n"
-                f"{hf_info}"
-                f"{git_info}"
-                f"🏢 Source: {p.get('source', 'Unknown')}\n"
-                f"📝 要約: {p.get('summary', '要約なし短評')}\n"
-                f"🏷️ タグ: {', '.join(p.get('tags', []))}\n"
-                f"💡 ポイント: {p.get('layman_point', 'なし')}\n"
-                f"⭐ 興味深さ: {p.get('interest_score', 0)}/10 | 🛠️ 汎用性: {p.get('applicability_score', 0)}/10\n"
                 f"--------------------------------------------"
+                f"📄 **{ai.get('title_ja', orig['title'])}**\n"
+                f"🔤 原題: {ai.get('title_en', orig['title'])}\n"
+                f"📅 公開日: {orig['published_date']} | 🛡️ 査読: {ai.get('peer_review_status', 'Preprint（査読未定）')}\n"
+                f"🔗 arXiv Abs: {orig['arxiv_url']}\n"
+                f"📕 PDF: {orig['pdf_url']}\n"
+                f"{hf_info}{git_info}"
+                f"🏢 Source: {orig['source']}\n"
+                f"📝 要約: {ai.get('summary', '要約エラー')}\n"
+                f"🏷️ タグ: {', '.join(ai.get('tags', []))}\n"
+                f"💡 ポイント: {ai.get('layman_point', 'なし')}\n"
+                f"⭐ 興味深さ: {ai.get('interest_score', 0)}/10 | 🛠️ 汎用性: {ai.get('applicability_score', 0)}/10\n"
             )
             requests.post(DISCORD_URL, json={"content": msg})
+            
+            # 【確実な履歴保存】送信が確定した論文のみ履歴に登録
+            history[orig['id']] = now_s
             time.sleep(1)
         
-        now_s = datetime.now(timezone.utc).isoformat()
-        for p in selected:
-            if p.get('id'):
-                history[p['id']] = now_s
-                
         with open(HISTORY_FILE, "w") as f:
-            for pid, ts in history.items(): f.write(f"{pid}|{ts}\n")
+            for pid, ts in history.items(): 
+                f.write(f"{pid}|{ts}\n")
         print("All processes finished successfully.")
     else:
-        parse_err = "⚠️ **構文エラー**: LLMから応答はありましたが、JSON形式へのパースに失敗しました。出力を確認してください。"
-        print(parse_err)
-        requests.post(DISCORD_URL, json={"content": parse_err})
+        requests.post(DISCORD_URL, json={"content": "⚠️ **構文エラー**: AIからのレスポンスを正しく解析できませんでした。"})
 
 if __name__ == "__main__":
     try:
-        # コマンドライン引数から日付（YYYY-MM-DD）を取得。なければNone
-        parser = argparse.ArgumentParser(description="Daily Paper Checker")
-        parser.add_argument("date", nargs="?", default=None, help="Target date in YYYY-MM-DD format (optional)")
+        parser = argparse.ArgumentParser()
+        parser.add_argument("date", nargs="?", default=None)
         args = parser.parse_args()
         
-        # もし日付のフォーマットチェックをしたい場合はここで validate しても良いです
         if args.date and not re.match(r"^\d{4}-\d{2}-\d{2}$", args.date):
-            print("Error: Date format must be YYYY-MM-DD")
             sys.exit(1)
 
         main(target_date=args.date)
-        
     except Exception as e:
         error_reason = "".join(traceback.format_exception_only(type(e), e)).strip()
-        msg_parts = [
-            "🚨 **プログラム実行エラーが発生しました**",
-            "```",
-            error_reason,
-            "```"
-        ]
+        msg_parts = ["🚨 **プログラム実行エラーが発生しました**", "```", error_reason, "
+```"]
         error_msg = "\n".join(msg_parts)
-        print(error_msg)
-        
         if DISCORD_URL:
-            try:
-                requests.post(DISCORD_URL, json={"content": error_msg})
-            except Exception as discord_err:
-                print(f"Failed to send error notification to Discord: {discord_err}")
+            try: requests.post(DISCORD_URL, json={"content": error_msg})
+            except: pass
