@@ -95,7 +95,8 @@ def get_hf_papers(target_date_str=None):
                 "published_date": pub_date,
                 "github_url": "",
                 "journal_ref": "",
-                "comment": ""
+                "comment": "",
+                "upvotes": p.get('upvotes', 0)
             })
             
         papers.sort(key=lambda x: x['upvotes'], reverse=True)
@@ -153,7 +154,6 @@ def get_hf_monthly_backup(history, count=3, exclude_ids=None):
         return []
 
 def get_arxiv_papers():
-    """【修正】学会名や企業名の縛りを無くし、純粋に指定カテゴリの最新論文を確実に取得する"""
     print("Fetching from arXiv...")
     query = 'cat:cs.AI OR cat:cs.LG OR cat:cs.CL'
     search = arxiv.Search(query=query, max_results=30, sort_by=arxiv.SortCriterion.SubmittedDate)
@@ -185,6 +185,7 @@ def get_arxiv_papers():
         return []
 
 def call_llm(prompt):
+    """【修正】応答テキストと一緒に、実際に成功したモデル名も返すように変更"""
     models = [
         "meta-llama/llama-3.3-70b-instruct:free",
         "google/gemma-4-31b-it:free",
@@ -197,7 +198,7 @@ def call_llm(prompt):
             try:
                 print(f"Trying Google Gemini ({m_name})...")
                 res = client.models.generate_content(model=m_name, contents=prompt)
-                if res.text: return res.text
+                if res.text: return res.text, f"Gemini ({m_name})"
             except Exception as e:
                 print(f"Gemini {m_name} failed: {e}")
     if OPENROUTER_KEY:
@@ -214,9 +215,12 @@ def call_llm(prompt):
                     result = resp.json()
                     if 'choices' in result:
                         content = result['choices'][0]['message']['content']
-                        if content: return content
+                        if content: 
+                            # OpenRouterの場合はスラッシュ以降のモデル名だけを綺麗に抽出
+                            short_name = m_id.split('/')[-1] if '/' in m_id else m_id
+                            return content, short_name
             except: continue
-    return None
+    return None, None
 
 def parse_json_from_text(text):
     if not text: return None
@@ -239,18 +243,16 @@ def main(target_date=None):
     ar_new = [p for p in ar_all if p['id'] not in history]
     
     final_papers = []
-    survey_paper = None
     chosen_ids = []
+    survey_paper = None
     
-    # 1. 完全新着なしモード：月間ランキングから未読3本を取得
     if not hf_new and not ar_new:
-        print("No new papers found. Fetching Monthly Top papers...")
+        print("No new papers found at all. Fetching Monthly Top 3 papers...")
         backup_candidates = get_hf_monthly_backup(history, count=15)
         if backup_candidates:
             final_papers = backup_candidates[:3]
             chosen_ids = [p['id'] for p in final_papers]
             
-            # 4本目以降にSurvey論文があれば追加枠にする
             for p in backup_candidates[3:]:
                 if is_survey_paper(p['title'], p['summary']):
                     survey_paper = p
@@ -260,47 +262,50 @@ def main(target_date=None):
             no_paper_msg = f"📅 **{today} 厳選AI論文リスト**\n新しい論文、および月間ランキングに対象となる未読論文はありませんでした。"
             requests.post(DISCORD_URL, json={"content": no_paper_msg})
             return
+            
     else:
-        # 2. 新着ありモード：基本HF 2本 + arXiv 2本 = 計4本
-        # 【強化】HFとarXiv間で同じ論文が重複して選ばれないよう厳密にID管理
-        hf_candidates = hf_new[:2]
+        print("Executing strict pipeline requested by user...")
+        if len(hf_new) >= 2:
+            hf_candidates = hf_new[:2]
+        else:
+            hf_candidates = list(hf_new)
+            deficit = 2 - len(hf_candidates)
+            exclude = [p['id'] for p in hf_candidates]
+            backup_hf = get_hf_monthly_backup(history, count=deficit, exclude_ids=exclude)
+            hf_candidates.extend(backup_hf)
+            
         chosen_ids = [p['id'] for p in hf_candidates]
+        final_papers.extend(hf_candidates)
         
-        # arXiv側からは、既読でなく、かつ今回選んだHFとも被っていないものを上から2本確保
         ar_candidates = [p for p in ar_new if p['id'] not in chosen_ids][:2]
+        final_papers.extend(ar_candidates)
         chosen_ids.extend([p['id'] for p in ar_candidates])
         
-        final_papers.extend(hf_candidates)
-        final_papers.extend(ar_candidates)
-        
-        # 万が一、どちらかが新着不足で合計4本に満たない場合は、新着の残りで枠を埋める
-        if len(final_papers) < 4:
-            remaining_hf = [p for p in hf_new if p['id'] not in chosen_ids]
-            remaining_ar = [p for p in ar_new if p['id'] not in chosen_ids]
-            
-            for p in remaining_hf:
-                if len(final_papers) >= 4: break
-                final_papers.append(p)
-                chosen_ids.append(p['id'])
-            for p in remaining_ar:
-                if len(final_papers) >= 4: break
-                final_papers.append(p)
-                chosen_ids.append(p['id'])
-        
-        # それでも4本に満たない場合は月間ランキングから補填
         if len(final_papers) < 4:
             deficit = 4 - len(final_papers)
-            backup = get_hf_monthly_backup(history, count=deficit, exclude_ids=chosen_ids)
-            final_papers.extend(backup)
-            chosen_ids.extend([p['id'] for p in backup])
+            remaining_hf = [p for p in hf_new if p['id'] not in chosen_ids]
+            final_papers.extend(remaining_hf[:deficit])
+            chosen_ids.extend([p['id'] for p in remaining_hf[:deficit]])
             
-        # --- Survey論文の追加枠チェック ---
-        # まだ選ばれていない（final_papersに入っていない）残りのすべての新着論文からSurveyを探す
+        if len(final_papers) < 4:
+            deficit = 4 - len(final_papers)
+            backup_all = get_hf_monthly_backup(history, count=deficit, exclude_ids=chosen_ids)
+            final_papers.extend(backup_all)
+            chosen_ids.extend([p['id'] for p in backup_all])
+        
         remaining_all_new = [p for p in (hf_new + ar_new) if p['id'] not in chosen_ids]
         for p in remaining_all_new:
             if is_survey_paper(p['title'], p['summary']):
                 survey_paper = p
                 break
+                
+        if not survey_paper:
+            backup_surveys = get_hf_monthly_backup(history, count=20, exclude_ids=chosen_ids)
+            for p in backup_surveys:
+                if is_survey_paper(p['title'], p['summary']):
+                    survey_paper = p
+                    survey_paper['source'] += " (Monthly)"
+                    break
 
     if survey_paper:
         print(f"Found a survey paper! Adding as extra slot: {survey_paper['title']}")
@@ -318,7 +323,6 @@ def main(target_date=None):
             "source": p['source']
         })
 
-    # 【修正】査読ステータスの項目をプロンプトから完全に削除
     prompt = f"""
     あなたはAIリサーチの専門家です。提示されたすべての論文について、指定のJSON配列形式でのみ翻訳・解説を出力してください。
     選別の必要はありません。提供された【すべてのインデックス】を網羅してください。JSON以外の文章は一切不要です。
@@ -339,7 +343,8 @@ def main(target_date=None):
     データ: {json.dumps(llm_input_data, ensure_ascii=False)}
     """
     
-    report_text = call_llm(prompt)
+    # 応答と一緒にモデル名（used_model）を受け取る
+    report_text, used_model = call_llm(prompt)
     if not report_text:
         requests.post(DISCORD_URL, json={"content": "⚠️ **致命的エラー**: AIモデルからの応答取得に失敗しました。"})
         return
@@ -355,7 +360,9 @@ def main(target_date=None):
             if idx is not None and idx < len(final_papers):
                 valid_selected.append((final_papers[idx], item))
         
-        header = f"📅 **{today} 厳選AI論文リスト**\n"
+        # 【修正】タイトルヘッダーの後ろに使用したLLMの名前を追加
+        model_info = used_model if used_model else "Unknown AI"
+        header = f"📅 **{today} 厳選AI論文リスト** (AI: {model_info})\n"
         for i, (orig, ai) in enumerate(valid_selected, 1):
             header += f"{i}. {ai.get('title_ja', orig['title'])} ({orig['source']})\n"
         requests.post(DISCORD_URL, json={"content": header})
@@ -366,7 +373,6 @@ def main(target_date=None):
             git_info = f"💻 GitHub: {orig['github_url']}\n" if orig['github_url'] else ""
             hf_info = f"🤗 Hugging Face: {orig['hf_url']}\n" if orig['hf_url'] else ""
             
-            # 【修正】「🛡️ 査読」の行を完全に削除
             msg = (
                 f"--------------------------------------------\n"
                 f"📄 **{ai.get('title_ja', orig['title'])}**\n"
@@ -384,11 +390,12 @@ def main(target_date=None):
             requests.post(DISCORD_URL, json={"content": msg})
             
             history[orig['id']] = now_s
+            with open(HISTORY_FILE, "w") as f:
+                for pid, ts in history.items(): 
+                    f.write(f"{pid}|{ts}\n")
+            print(f"Successfully recorded to history: {orig['id']}")
             time.sleep(1)
-        
-        with open(HISTORY_FILE, "w") as f:
-            for pid, ts in history.items(): 
-                f.write(f"{pid}|{ts}\n")
+            
         print("All processes finished successfully.")
     else:
         requests.post(DISCORD_URL, json={"content": "⚠️ **構文エラー**: AIからのレスポンスを正しく解析できませんでした。"})
