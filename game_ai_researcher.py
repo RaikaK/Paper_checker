@@ -12,7 +12,7 @@ import requests
 # --- 設定 ---
 MAX_POSTS = 2             # 毎日最大何本投稿するか (1または2)
 GEMINI_KEY = os.getenv("GEMINI_API_KEY_2")
-DISCORD_URL = os.getenv("DISCORD_WEBHOOK_URL")
+DISCORD_URL = os.getenv("GAME_WEBHOOK_URL")
 
 HISTORY_FILE = "history.txt"
 RETENTION_DAYS = 30       # 履歴保持期間
