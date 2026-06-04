@@ -1,22 +1,20 @@
-name: Daily Paper Checker
+name: Daily Paper Checker Suite
 
 # =================================================================
 # 1. トリガー（実行タイミング）の設定部分
 # =================================================================
 on:
-  # 【定期自動実行】（今まで通り毎日自動で動かす設定）
+  # 【定期自動実行】（毎日指定時間に自動で動かす設定）
   schedule:
-    - cron: '0 22 * * *'  # 時間はご自身の現在の設定に合わせてください
+    - cron: '0 22 * * *'  # 日本時間あさ7:00（必要に応じて時間を調整してください）
   
   # 【手動実行（タイムマシン機能）】の設定
-  # この「workflow_dispatch」というブロックを丸ごと追加します
   workflow_dispatch:
     inputs:
-      target_date:  # ← この変数名は変更しないでください（Python側がこの名前で受け取ります）
-        # ↓ ここはGitHubの画面に表示される説明文です。自由に書き換えてOKです！
-        description: '取得したい過去の日付を入力（例: 2026-05-15）。今日のを取る場合は空欄のままでOK。'
-        required: false  # 空欄での実行（通常の今日付け処理）を許可するためにfalseにします
-        default: ''      # デフォルトは空欄にしておきます
+      target_date:
+        description: '取得したい過去の日付を入力（例: 2026-05-15）。今日の分を取る場合は空欄のままでOK。'
+        required: false
+        default: ''
 
 # =================================================================
 # 2. 実際の処理内容（ジョブ）の設定部分
@@ -25,46 +23,70 @@ jobs:
   paper_check_job:
     runs-on: ubuntu-latest
     steps:
-      # リポジトリのコードをチェックアウト（既存のまま）
+      # リポジトリのコードをチェックアウト
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Pythonの環境構築（既存のまま）
+      # Pythonの環境構築
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      # ライブラリのインストール（既存のまま。requirements.txt等があればそちらに合わせてください）
+      # ライブラリのインストール
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install google-genai arxiv requests
 
-      # 履歴ファイルをGitHubに保存・復元するためのキャッシュ設定（既存のまま）
-      # ※ もし現在history.txtの保持に別の手段（Artifactsや別のリポジトリへのpush等）を
-      # 使っている場合は、ご自身の既存のステップに合わせてください。
-      - name: Restore or Initialize History
+      # 各履歴ファイルがなければ初期化
+      - name: Initialize History Files
         run: |
-          if [ ! -f history.txt ]; then
-            touch history.txt
-          fi
+          [ -f history.txt ] || touch history.txt
+          [ -f history_security.txt ] || touch history_security.txt
 
-      # 【最重要：実行コマンドの修正部分】
-      # 以前は「run: python daily_paper.py」だけだった部分の末尾に、
-      # 変数「${{ github.event.inputs.target_date }}」を付け加えます。
-      - name: Run Paper Checker
+      # --------------------------------===========================
+      # ステップ1: 総合版（通常版）の実行
+      # --------------------------------===========================
+      - name: Run Daily Paper Checker (General)
         env:
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        # 後ろにスペースを空けて変数を置くことで、手動入力された日付（空欄なら何もなし）がPythonの引数に渡ります
         run: python daily_paper.py ${{ github.event.inputs.target_date }}
 
-      - name: Commit and Push history.txt
+      # --------------------------------===========================
+      # ステップ2: 20分待機 ➔ ゲームAI版の実行
+      # --------------------------------===========================
+      - name: Wait 20 minutes for Game AI
+        run: sleep 1200  # 1200秒 = 20分
+
+      - name: Run Game AI Researcher
+        env:
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }} # ゲームAI版コード内の環境変数名に準拠
+        run: python game_ai_researcher.py ${{ github.event.inputs.target_date }}
+
+      # --------------------------------===========================
+      # ステップ3: 20分待機 ➔ セキュリティ版の実行
+      # --------------------------------===========================
+      - name: Wait 20 minutes for Security
+        run: sleep 1200  # 1200秒 = 20分
+
+      - name: Run Security Researcher
+        env:
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          SECURITY_WEBHOOK_URL: ${{ secrets.SECURITY_WEBHOOK_URL }} # ご指定の専用Webhook用変数
+        run: python security_researcher.py ${{ github.event.inputs.target_date }}
+
+      # --------------------------------===========================
+      # ステップ4: 変更されたすべての履歴ファイルをまとめて保存
+      # --------------------------------===========================
+      - name: Commit and Push All Histories
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add history.txt
-          # history.txt に変更があった場合のみ保存（コミット）して、リポジトリに反映（プッシュ）する
-          git diff --cached --quiet || (git commit -m "Update paper history [skip ci]" && git push)
+          # 2つの履歴ファイルをステージングに追加
+          git add history.txt history_security.txt
+          # どちらかのファイルに変更があった場合のみコミットしてプッシュ
+          git diff --cached --quiet || (git commit -m "Update paper and security history [skip ci]" && git push)
