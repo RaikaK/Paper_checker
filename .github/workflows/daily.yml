@@ -62,20 +62,20 @@ jobs:
       # -----------------------------------------------------------
       # ステップ2: 20分待機 ➔ ゲームAI版の実行
       # -----------------------------------------------------------
-      - name: Wait 20 minutes for Game AI
-        run: sleep 1200  # 1200秒 = 20分
+      - name: Wait 5 minutes for Game AI
+        run: sleep 300  # 1200秒 = 20分
 
       - name: Run Game AI Researcher
         env:
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.GAME_WEBHOOK_URL }}
         run: python game_ai_researcher.py ${{ github.event.inputs.target_date }}
 
       # -----------------------------------------------------------
       # ステップ3: 20分待機 ➔ セキュリティ版の実行
       # -----------------------------------------------------------
-      - name: Wait 20 minutes for Security
-        run: sleep 1200  # 1200秒 = 20分
+      - name: Wait 5 minutes for Security
+        run: sleep 300  # 1200秒 = 20分
 
       - name: Run Security Researcher
         env:
