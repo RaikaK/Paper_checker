@@ -1,0 +1,66 @@
+name: Test - Game & Security Only (No Sleep)
+
+# =================================================================
+# トリガー：GitHubの画面から「手動」でいつでも好きな時に実行可能
+# =================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: 'テストしたい過去の日付（空欄なら通常通り直近分を検索）'
+        required: false
+        default: ''
+
+jobs:
+  test_job:
+    runs-on: ubuntu-latest
+    
+    # あなた（リポジトリの所有者）だけが実行できるように制限
+    if: github.actor == github.repository_owner
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-genai arxiv requests
+
+      - name: Initialize History Files
+        run: |
+          [ -f history.txt ] || touch history.txt
+          [ -f history_security.txt ] || touch history_security.txt
+
+      # -----------------------------------------------------------
+      # 【テスト1】ゲームAI版（20分待機なしで即実行）
+      # -----------------------------------------------------------
+      - name: Test Game AI Researcher
+        env:
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GAME_WEBHOOK_URL: ${{ secrets.GAME_WEBHOOK_URL }}
+        run: python game_ai_researcher.py ${{ github.event.inputs.target_date }}
+
+      # -----------------------------------------------------------
+      # 【テスト2】セキュリティ版（待機なしで即連続実行）
+      # -----------------------------------------------------------
+      - name: Test Security Researcher
+        env:
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          SECURITY_WEBHOOK_URL: ${{ secrets.SECURITY_WEBHOOK_URL }}
+        run: python security_researcher.py ${{ github.event.inputs.target_date }}
+
+      # -----------------------------------------------------------
+      # 【テスト3】履歴ファイルの書き込みテストと保存
+      # -----------------------------------------------------------
+      - name: Commit and Push All Histories
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add history.txt history_security.txt
+          git diff --cached --quiet || (git commit -m "Test: Update history files [skip ci]" && git push)
