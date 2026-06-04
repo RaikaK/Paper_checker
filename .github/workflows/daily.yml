@@ -4,9 +4,9 @@ name: Daily Paper Checker Suite
 # 1. トリガー（実行タイミング）の設定部分
 # =================================================================
 on:
-  # 【定期自動実行】（毎日指定時間に自動で動かす設定）
+  # 【定期自動実行】毎日自動で動かす設定
   schedule:
-    - cron: '0 22 * * *'  # 日本時間あさ7:00（必要に応じて時間を調整してください）
+    - cron: '0 22 * * *'  # 日本時間あさ7:00（必要に応じて調整してください）
   
   # 【手動実行（タイムマシン機能）】の設定
   workflow_dispatch:
@@ -22,6 +22,10 @@ on:
 jobs:
   paper_check_job:
     runs-on: ubuntu-latest
+    
+    # 【最重要ガード】実行者がリポジトリの所有者（あなた）自身である場合のみ実行を許可
+    if: github.actor == github.repository_owner
+
     steps:
       # リポジトリのコードをチェックアウト
       - name: Checkout repository
@@ -45,9 +49,9 @@ jobs:
           [ -f history.txt ] || touch history.txt
           [ -f history_security.txt ] || touch history_security.txt
 
-      # --------------------------------===========================
+      # -----------------------------------------------------------
       # ステップ1: 総合版（通常版）の実行
-      # --------------------------------===========================
+      # -----------------------------------------------------------
       - name: Run Daily Paper Checker (General)
         env:
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
@@ -55,38 +59,38 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python daily_paper.py ${{ github.event.inputs.target_date }}
 
-      # --------------------------------===========================
+      # -----------------------------------------------------------
       # ステップ2: 20分待機 ➔ ゲームAI版の実行
-      # --------------------------------===========================
+      # -----------------------------------------------------------
       - name: Wait 20 minutes for Game AI
         run: sleep 1200  # 1200秒 = 20分
 
       - name: Run Game AI Researcher
         env:
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }} # ゲームAI版コード内の環境変数名に準拠
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python game_ai_researcher.py ${{ github.event.inputs.target_date }}
 
-      # --------------------------------===========================
+      # -----------------------------------------------------------
       # ステップ3: 20分待機 ➔ セキュリティ版の実行
-      # --------------------------------===========================
+      # -----------------------------------------------------------
       - name: Wait 20 minutes for Security
         run: sleep 1200  # 1200秒 = 20分
 
       - name: Run Security Researcher
         env:
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
-          SECURITY_WEBHOOK_URL: ${{ secrets.SECURITY_WEBHOOK_URL }} # ご指定の専用Webhook用変数
+          SECURITY_WEBHOOK_URL: ${{ secrets.SECURITY_WEBHOOK_URL }}
         run: python security_researcher.py ${{ github.event.inputs.target_date }}
 
-      # --------------------------------===========================
+      # -----------------------------------------------------------
       # ステップ4: 変更されたすべての履歴ファイルをまとめて保存
-      # --------------------------------===========================
+      # -----------------------------------------------------------
       - name: Commit and Push All Histories
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          # 2つの履歴ファイルをステージングに追加
+          # 履歴ファイルをステージングに追加
           git add history.txt history_security.txt
           # どちらかのファイルに変更があった場合のみコミットしてプッシュ
           git diff --cached --quiet || (git commit -m "Update paper and security history [skip ci]" && git push)
