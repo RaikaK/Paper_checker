@@ -6,7 +6,7 @@ name: Daily Paper Checker Suite
 on:
   # 【定期自動実行】毎日自動で動かす設定
   schedule:
-    - cron: '0 22 * * *'  # 日本時間あさ7:00（必要に応じて調整してください）
+    - cron: '0 22 * * *'  # 日本時間あさ7:00
   
   # 【手動実行（タイムマシン機能）】の設定
   workflow_dispatch:
@@ -60,27 +60,27 @@ jobs:
         run: python daily_paper.py ${{ github.event.inputs.target_date }}
 
       # -----------------------------------------------------------
-      # ステップ2: 20分待機 ➔ ゲームAI版の実行
+      # ステップ2: 5分待機 ➔ ゲームAI版の実行
       # -----------------------------------------------------------
       - name: Wait 5 minutes for Game AI
-        run: sleep 300  # 1200秒 = 20分
+        run: sleep 300  # 300秒 = 5分 (あえての短縮設定)
 
       - name: Run Game AI Researcher
         env:
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.GAME_WEBHOOK_URL }}
+          GAME_WEBHOOK_URL: ${{ secrets.GAME_WEBHOOK_URL }}  # ⭕️ 変数名をPython側と完全一致に修正
         run: python game_ai_researcher.py ${{ github.event.inputs.target_date }}
 
       # -----------------------------------------------------------
-      # ステップ3: 20分待機 ➔ セキュリティ版の実行
+      # ステップ3: 5分待機 ➔ セキュリティ版の実行
       # -----------------------------------------------------------
       - name: Wait 5 minutes for Security
-        run: sleep 300  # 1200秒 = 20分
+        run: sleep 300  # 300秒 = 5分 (あえての短縮設定)
 
       - name: Run Security Researcher
         env:
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
-          SECURITY_WEBHOOK_URL: ${{ secrets.SECURITY_WEBHOOK_URL }}
+          SECURITY_WEBHOOK_URL: ${{ secrets.SECURITY_WEBHOOK_URL }}  # ⭕️ 完璧に合っています
         run: python security_researcher.py ${{ github.event.inputs.target_date }}
 
       # -----------------------------------------------------------
