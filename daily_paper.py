@@ -194,13 +194,21 @@ def call_llm(prompt):
         "deepseek/deepseek-r1:free"
     ]
     if client:
-        for m_name in ['gemini-2.0-flash', 'gemini-1.5-flash']:
+        # ─── 利用可能な最新のGeminiモデルリストに更新 ───
+        gemini_models = [
+            "gemini-3.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ]
+        for m_name in gemini_models:
             try:
                 print(f"Trying Google Gemini ({m_name})...")
                 res = client.models.generate_content(model=m_name, contents=prompt)
                 if res.text: return res.text, f"Gemini ({m_name})"
             except Exception as e:
                 print(f"Gemini {m_name} failed: {e}")
+                
     if OPENROUTER_KEY:
         for m_id in models:
             try:
